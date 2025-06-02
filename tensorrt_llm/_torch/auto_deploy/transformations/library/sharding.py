@@ -35,6 +35,7 @@ from ...utils.node_utils import (
 )
 from ...utils.quantization_utils import QuantizationImpl
 from .._graph import canonicalize_graph
+from ..distributed.distributed_classes import *
 
 
 def _load_hook(
@@ -277,6 +278,150 @@ def column_row_shard(
                 unaccounted_nodes.add(current_node)
             current_node = current_node.next
             assert current_node, "Could not identify next node"
+
+        all_nodes_between_start_end = [n for n in gm.graph.nodes if n_start <= n < n_end]
+
+        # nothing to shard
+        if len(nodes_linear) == 0:
+            continue
+
+        # simple shard when we have != 2 groups of linear nodes
+        if len(nodes_linear) != 2:
+            ad_logger.debug(f"Linear groups: {nodes_linear}")
+            _simple_shard(gm, nodes_linear, rank, world_size)
+            continue
+
+        # let's look at the unnacounted nodes. They are okay as long as they fall before the
+        # first linear node or after the last linear node, i.e., outside the sharded region
+        lin_nodes_flat: Set[Node] = {n for group in nodes_linear.values() for n in group}
+        lin_nodes_passed: Set[Node] = set()
+        current_node = n_start
+        while current_node != n_end:
+            # check if this is another linear node
+            if current_node in lin_nodes_flat:
+                lin_nodes_passed.add(current_node)
+
+            # check if we are OUTSIDE sharded region
+            if len(lin_nodes_passed) == 0 or lin_nodes_passed == lin_nodes_flat:
+                # remove node from unaccounted nodes since we are outside and it doesn't matter
+                unaccounted_nodes.discard(current_node)
+                attention_related_nodes.discard(current_node)
+                attention_nodes.discard(current_node)
+
+            current_node = current_node.next
+
+        # let's post-process the attention-related nodes
+        # we can disregard them if we also see attention nodes and we assume they are compatible
+        if len(attention_nodes) > 0:
+            attention_related_nodes.clear()
+
+        # check if any unaccounted nodes are left. If so, do a simply shard
+        if unaccounted_nodes or attention_related_nodes:
+            ad_logger.debug(f"Unaccounted nodes: {unaccounted_nodes}")
+            _simple_shard(gm, nodes_linear, rank, world_size)
+            continue
+
+        # If we can account for all sharded nodes, we can do a two-way shard
+        # --> row_split (dim 0) + col_split (dim 1) + all_reduce
+        for i, group in enumerate(nodes_linear.values()):
+            for n in group:
+                _insert_sharded_matmul(gm, n, i, rank, world_size, add_dist=i > 0)
+
+    # canonicalize and return
+    gm = canonicalize_graph(gm)
+    ad_logger.debug("After sharding: " + str(gm))
+    return gm
+
+
+
+
+def distribute_3d(gm: GraphModule, rank: int, world_size: int) -> GraphModule:
+    """A transformation to apply sharding to the model following tensor parallelism.
+
+    The transformation is based on the following steps:
+
+    1. Identify boundary nodes between residual nodes to identify shardable regions.
+    2. Identify the GEMM nodes that can be sharded
+    3. Trace through the subgraph using DFS/BFS between each pair of boundary nodes
+    4. Account for each node in the trace to ensure the op is correct even after sharding. This is
+       necessary to ensure that the sharding is correct and we need to be able to account for
+       **all** nodes in the subgraph. The subgraph here is defined as the region between the first
+       linear node to the last linear node of an identified sharding region.
+    # 5. Shard the GEMM nodes or skip accordingly.
+    """
+    ad_logger.info("Sharding graph for TP")
+    ad_logger.debug("Before sharding graph: " + str(gm))
+
+    if world_size < 2:
+        ad_logger.info("Skipping sharding for single device")
+        return gm
+
+    assert isinstance(gm, GraphModule), "Expecting GraphModule"
+
+    # find boundary nodes of regions we want to shard
+    boundary_nodes = identify_regions_between_residuals(gm)
+
+    # TODO: continue updating these lists
+    # pointwise ops that don't affect the sharder
+    pointwise_ops = {
+        torch.ops.aten.gelu,
+        torch.ops.aten.leaky_relu,
+        torch.ops.aten.mul,
+        torch.ops.aten.relu,
+        torch.ops.aten.sigmoid,
+        torch.ops.aten.silu,
+        torch.ops.aten.tanh,
+        torch.ops.aten.contiguous,
+    }
+
+    # acceptable attention nodes between sharded GEMMs
+    shardable_attention_nodes = {
+        torch.ops.attention.scaled_dot_product_attention,
+        torch.ops.attention.grouped_sdpa,
+        torch.ops.attention.bsnd_grouped_sdpa,
+    }
+
+    # This is a heuristic. Basically, we assume those are okay to shard if we also encounter an
+    # attention node because we know that those ops must be compatible with the attention op. Now
+    # since the attention op is shardable, we will assume those are as well if used in conjunction
+    # with the attention op.
+    shardable_nodes_with_attention = {
+        torch.ops.aten.view,
+        torch.ops.aten.reshape,
+        torch.ops.rope.flashinfer,
+        operator.getitem,
+    }
+
+    # let's look at linear nodes we can identify between pairs of boundary nodes
+    # There is three potential cases we can handle:
+    # 1. No linear nodes:
+    #       --> just continue
+    # 2. Two groups of linear nodes and we can account for all to the view nodes:
+    #       --> row_split (dim 0) 1st group + check for supported nodes +
+    #           col_split (dim 1) 2nd group + all_reduce output of 2nd group
+    # 3. Linear nodes that are not in two groups or we cannot account for all nodes:
+    #       --> row_split (dim 0 of weight) + all_gather (dim -1 of output) output
+    for n_start, n_end in zip(boundary_nodes[:-1], boundary_nodes[1:]):
+        # we iterate through all nodes between the two boundary nodes and store linear nodes
+        # sorted by their input activation node. We also store remaining nodes.
+        nodes_linear: DefaultDict[Node, List[Node]] = defaultdict(list)
+        attention_nodes: Set[Node] = set()
+        attention_related_nodes: Set[Node] = set()
+        unaccounted_nodes: Set[Node] = set()
+        current_node = n_start
+        while current_node != n_end:
+            if is_linear_op(current_node, include_quantization=True):
+                nodes_linear[current_node.args[0]].append(current_node)
+            elif is_op(current_node, shardable_attention_nodes):
+                attention_nodes.add(current_node)
+            elif is_op(current_node, shardable_nodes_with_attention):
+                attention_related_nodes.add(current_node)
+            elif not is_op(current_node, pointwise_ops):
+                unaccounted_nodes.add(current_node)
+            current_node = current_node.next
+            assert current_node, "Could not identify next node"
+
+        all_nodes_between_start_end = [n for n in gm.graph.nodes if n_start <= n < n_end]
 
         # nothing to shard
         if len(nodes_linear) == 0:

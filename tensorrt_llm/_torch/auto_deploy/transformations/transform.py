@@ -16,6 +16,7 @@ from ._graph import canonicalize_graph, lift_to_meta, move_to_device
 from .export import torch_export_to_gm
 from .library import (
     column_row_shard,
+    distribute_3d,
     dp_bmm_shard,
     eliminate_redundant_transposes,
     ep_shard,
@@ -79,6 +80,7 @@ class InferenceOptimizer:
         # INITIALIZE MODEL
         ############################################################################################
         model = self.factory.build_model(device="meta")
+        config = model.config
 
         ############################################################################################
         # EXPORT MODEL TO GRAPH MODULE
@@ -89,6 +91,8 @@ class InferenceOptimizer:
         del model
         ad_logger.debug("original graph: " + str(egm))
         local_rank, world_size = dist_ad.get_rank_world_size()
+
+        world_size = 16
 
         ############################################################################################
         # RUN PATTERN MATCHER TRANSFORMATIONS TO STANDARDIZE GRAPH REPRESENTATION
@@ -134,11 +138,16 @@ class InferenceOptimizer:
         # see https://github.com/NVIDIA/TensorRT-LLM/pull/3668#discussion_r2052714528
         egm = optimize_rope(egm)
 
+        from .library import visualize_graph
+
+        visualize_graph(egm, filename="qwen.svg")
+
         # run TP sharding across ranks
         egm = column_row_shard(egm, local_rank, world_size, self.ad_config.simple_shard_only)
 
         # run EP sharding across ranks
         egm = ep_shard(egm, local_rank, world_size)
+        visualize_graph(egm, filename="qwen_ep_shard.svg")
 
         # run BMM sharding across ranks
         egm = dp_bmm_shard(egm, local_rank, world_size)
@@ -180,9 +189,9 @@ class InferenceOptimizer:
         # visualize the final graph
         if self.visualize:
             try:
-                from .library import visualize_namespace
+                from .library import visualize_graph
 
-                visualize_namespace(egm, args=cm.args, dynamic_shapes=cm.dynamic_shapes)
+                visualize_graph(egm, filename="qwen.svg")
                 ad_logger.warning(
                     "Please run `pip install -r examples/auto_deploy/requirements.txt` to visualize"
                     " the graph."

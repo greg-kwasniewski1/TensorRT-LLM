@@ -12,6 +12,6 @@ from .rope import *
 from .sharding import *
 
 try:
-    from .visualization import visualize_namespace
+    from .visualization import visualize_namespace, visualize_graph
 except ImportError:
     pass
