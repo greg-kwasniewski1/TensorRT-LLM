@@ -235,6 +235,7 @@ def is_dist_op(node: Node) -> bool:
     dist_ops = {
         torch.ops.dist.all_gather,
         torch.ops.dist.all_reduce,
+        torch.ops.dist.P2POp
     }
     return is_op(node, dist_ops)
 
@@ -314,6 +315,38 @@ def identify_regions_between_residuals(gm: GraphModule) -> List[Node]:
 
 
 def bfs(
+    node: Node, target: Callable, attr_next: str = "users", 
+    boundary: Optional[Node] = None, 
+    skip_root = False,
+    allow_empty = False,
+) -> Node:
+    queue = [node]
+    visited = set()
+    if skip_root:
+        visited.add(node)
+        queue = list(n for n in getattr(node, attr_next) if n is not None)
+    while queue:
+        cur_node = queue.pop(0)
+        if boundary is not None and cur_node == boundary:
+            continue  # Skip the boundary node.
+        if target(cur_node):
+            return cur_node
+        for next_node in getattr(cur_node, attr_next):
+            if next_node is None or not isinstance(next_node, Node):
+                continue
+            if boundary is not None and next_node == boundary:
+                continue  # Do not expand past the boundary.
+            if next_node not in visited:
+                visited.add(next_node)
+                queue.append(next_node)
+    if allow_empty:
+        return None
+    raise RuntimeError(f"Could not find node with target condition {target}.")
+
+
+
+
+def bfs_(
     node: Node, target: Callable, attr_next: str = "users", boundary: Optional[Node] = None
 ) -> Node:
     queue = [node]
@@ -390,3 +423,25 @@ def extract_op_args(node: Node, *arg_names):
         raise RuntimeError(f"Could not find a value for '{name}' on op {op}")
 
     return [_get(n) for n in arg_names]
+
+
+
+
+def create_symint_mapping(gm: GraphModule):
+    """Create a mapping from SymInt expressions to their corresponding nodes."""
+    symint_to_node = {}
+    
+    for node in gm.graph.nodes:
+        if node.op == "placeholder":
+            # Check if the node itself is a SymInt
+            if isinstance(node.meta.get("val"), torch.SymInt):
+                symint_to_node[str(node.meta["val"])] = node
+            
+            # Check tensor shapes for SymInt dimensions
+            elif hasattr(node.meta.get("val"), 'shape'):
+                fake_tensor = node.meta["val"]
+                for dim_idx, dim_size in enumerate(fake_tensor.shape):
+                    if isinstance(dim_size, torch.SymInt):
+                        symint_to_node[str(dim_size)] = dim_size
+    
+    return symint_to_node

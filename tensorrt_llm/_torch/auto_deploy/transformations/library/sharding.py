@@ -30,12 +30,14 @@ from ...utils.node_utils import (
     extract_param_names_from_lin_node,
     identify_regions_between_residuals,
     is_linear_op,
+    is_dist_op,
     is_op,
     num_users_of_weight_node,
+    bfs
 )
 from ...utils.quantization_utils import QuantizationImpl
 from .._graph import canonicalize_graph
-from ..distributed.distributed_classes import *
+from ...distributed.distributed_classes import *
 
 
 def _load_hook(
@@ -335,21 +337,8 @@ def column_row_shard(
 
 
 
-def distribute_3d(gm: GraphModule, rank: int, world_size: int) -> GraphModule:
-    """A transformation to apply sharding to the model following tensor parallelism.
 
-    The transformation is based on the following steps:
-
-    1. Identify boundary nodes between residual nodes to identify shardable regions.
-    2. Identify the GEMM nodes that can be sharded
-    3. Trace through the subgraph using DFS/BFS between each pair of boundary nodes
-    4. Account for each node in the trace to ensure the op is correct even after sharding. This is
-       necessary to ensure that the sharding is correct and we need to be able to account for
-       **all** nodes in the subgraph. The subgraph here is defined as the region between the first
-       linear node to the last linear node of an identified sharding region.
-    # 5. Shard the GEMM nodes or skip accordingly.
-    """
-    ad_logger.info("Sharding graph for TP")
+def distribute_3d(gm: GraphModule, rank: int, world_size: int, config) -> GraphModule:
     ad_logger.debug("Before sharding graph: " + str(gm))
 
     if world_size < 2:
@@ -358,8 +347,131 @@ def distribute_3d(gm: GraphModule, rank: int, world_size: int) -> GraphModule:
 
     assert isinstance(gm, GraphModule), "Expecting GraphModule"
 
-    # find boundary nodes of regions we want to shard
-    boundary_nodes = identify_regions_between_residuals(gm)
+    batch_size = config.batch_size
+    seq_len = config.seq_len
+    embd = config.hidden_size
+    num_heads = config.num_attention_heads
+    head_dim = config.hidden_size // config.num_attention_heads
+    if "num_key_value_heads" in config:
+        num_kv_heads = config.num_key_value_heads
+    else:
+        num_kv_heads = num_heads
+    if "intermediate_size" in config:
+        mlp_dim = config.intermediate_size
+    vocab_size = config.vocab_size
+    kv_dim = embd * num_kv_heads // num_heads
+    
+    modes_extents = {
+        "b": batch_size,
+        "s": seq_len,
+        "e": embd,
+        "f": embd,
+        "h": num_heads,
+        "d": head_dim,
+        "v": vocab_size,
+        "m": mlp_dim,
+        "n": num_kv_heads,
+        "k": kv_dim,
+        "P": world_size,
+    }
+
+    def shape_to_einsum(fake_tensor_shape: torch.Size) -> str:
+        # b: batch size
+        # e: embedding size
+        # h: num heads
+        # d: head dim
+        # v: vocab size
+        # m: mlp dim
+        # n: num kv heads
+        # P: world size
+        einsum_str = ""
+        e_used = False
+        for dim in fake_tensor_shape:
+            if dim == embd:
+                if not e_used:
+                    einsum_str += "e"
+                    e_used = True
+                else:
+                    einsum_str += "f"
+            elif dim == num_heads:
+                einsum_str += "h"
+            elif dim == head_dim:
+                einsum_str += "d"
+            elif dim == vocab_size:
+                einsum_str += "v"
+            elif dim == mlp_dim:
+                einsum_str += "m"
+            elif dim == num_kv_heads:
+                einsum_str += "n"
+            elif dim == world_size:
+                einsum_str += "P"
+            elif dim == seq_len:
+                einsum_str += "s"
+            elif dim == batch_size:
+                einsum_str += "b"
+            elif dim == kv_dim:
+                einsum_str += "k"
+            else:
+                einsum_str += "u"
+                ad_logger.debug(f"Unknown dimension: {dim}")
+            
+        return einsum_str
+
+    # first pass over nodes - assign dist_tensor to each node
+    for n in gm.graph.nodes:
+        # infer data shapes
+        # if tensor_meta is available, use it to infer the shape
+        if 'tensor_meta' in n.meta:
+            tensor_meta = n.meta['tensor_meta']
+        else:
+            # get it from parent or child node
+            if len(n.args) > 0:
+                parent_node = n.args[0]
+                if isinstance(parent_node, tuple):
+                    parent_node = parent_node[0]
+                if 'tensor_meta' not in parent_node.meta:
+                    tensor_meta = None
+                else:
+                    tensor_meta = parent_node.meta['tensor_meta']
+            elif len(n.users) > 0:
+                child_node = list(n.users)[0]
+                tensor_meta = child_node.meta['tensor_meta']
+            else:
+                raise ValueError(f"Node {n} has no args or users")
+        
+        # figure out the tensor shape as an einsum string
+        if tensor_meta is not None:
+            einsum_str = shape_to_einsum(tensor_meta.shape)
+        else:
+            einsum_str = 'u' # u for unknown
+        dist_tensor = DistributedTensor(modes_extents, einsum_str)
+        n.meta['dist_tensor'] = dist_tensor
+
+    linear_layers = [n for n in gm.graph.nodes if is_linear_op(n)]
+    def find_previous_linear_node(n: Node) -> Node:
+        for prev_node in n.all_input_nodes:
+            if is_linear_op(prev_node):
+                return prev_node
+        return None
+
+
+
+
+    # second pass over nodes - find all linear nodes and assign distributed computation grid PGrid to each node
+    for n in gm.graph.nodes:
+        if is_linear_op(n, include_quantization=True):
+            prev_linear = bfs(n, 
+                              lambda x: is_linear_op(x, include_quantization=True) or is_dist_op(x), 
+                              attr_next = "args", 
+                              skip_root=True, allow_empty=True)
+            if prev_linear is not None:
+
+            n.meta['p_grid'] = PGrid(M_global=batch_size*seq_len,
+                                     N_global=embd,
+                                     K_global=embd,
+                                     P_m=world_size,
+                                     rank_order=(0, 1, 2))
+
 
     # TODO: continue updating these lists
     # pointwise ops that don't affect the sharder

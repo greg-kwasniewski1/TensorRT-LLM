@@ -8,15 +8,200 @@ import math
 import os
 import datetime
 from dataclasses import dataclass
-from models.model_config import SurrogateConfig
+
 def cdiv(a, b):
     return (a + b - 1) // b
 
-from utils.debug_utils import CRITICAL, VALUES, log, INFO, DEBUG
-from ml_kernels.elementary_seq_kernels import precompute_freqs_cis, apply_rotary_emb
+# from utils.debug_utils import CRITICAL, VALUES, log, INFO, DEBUG
+# from ml_kernels.elementary_seq_kernels import precompute_freqs_cis, apply_rotary_emb
 
 # STRATEGY = "megatron"
 STRATEGY = "COSMA"
+
+
+@dataclass
+class DistributedTensor:
+    p: int
+    P: int
+    einsum_str: str
+
+    
+    grid_extents: dict[str, int]
+    modes_extents: dict[str, int]
+    
+    # modes_extens_local = modes_extents / grid_extents
+    modes_extents_local: dict[str, int]
+    extent_order: dict[str, int]
+    extent_order_sorted = list[str]
+
+    def __init__(self,
+                 modes_extents: dict[str, int],
+                 einsum_str: str,
+                 extent_order_sorted: list[str] = None,
+                 grid_extents: dict[str, int] = None,
+                 world_size: int = None):       
+        rank = dist.get_rank()
+        if world_size is None:
+            world_size = dist.get_world_size()
+        self.P = world_size
+        self.p = rank
+        self.modes_extents = modes_extents
+        self.einsum_str = einsum_str
+
+        if not extent_order_sorted:
+            self.extent_order_sorted = list(sorted(modes_extents.keys()))
+        else:
+            self.extent_order_sorted = extent_order_sorted
+        
+        if not grid_extents:
+            self.grid_extents = {k: 1 for k in self.extent_order_sorted}
+        else:
+            self.grid_extents = grid_extents
+
+        self.extent_order = {}
+        i = 0
+        for k in self.extent_order_sorted:
+            if k in einsum_str:
+                self.extent_order[k] = i
+                i += 1        
+        
+
+        self.update_local_extents()
+        self.calculate_partial_prod()
+        self.p_coords = self.rank_to_coords()
+
+
+    def reinit(self):
+        self.update_local_extents()
+        self.calculate_partial_prod()
+        self.p_coords = self.rank_to_coords()
+        
+    
+    def calculate_partial_prod(self):
+        grid_extents_sorted = [self.grid_extents[mode] for mode in self.extent_order_sorted]
+        
+        self.partial_prod = {}
+        prev = 1
+        for i in range(len(self.extent_order_sorted)-1, -1, -1):
+            self.partial_prod[self.extent_order_sorted[i]] = prev            
+            prev *= grid_extents_sorted[i]
+
+    
+    def init_flattening(self):
+        """Initialize the flattening of the input tensors."""
+        self.non_contracted_modes_A = [mode for mode in self.tensor_A if mode in self.tensor_C]
+        if self.tensor_B is not None:
+            self.non_contracted_modes_B = [mode for mode in self.tensor_B if mode in self.tensor_C and mode not in self.tensor_A]
+        else:
+            self.non_contracted_modes_B = []
+        self.contracted_modes = [mode for mode in self.tensor_A if mode not in self.tensor_C]
+
+        self.M_global = int(np.prod([self.modes_extents[mode] for mode in self.non_contracted_modes_A]))
+        self.N_global = int(np.prod([self.modes_extents[mode] for mode in self.non_contracted_modes_B]))
+        self.K_global = int(np.prod([self.modes_extents[mode] for mode in self.contracted_modes]))    
+        
+
+    
+    def update_local_extents(self):
+        # update local extents of non_contracted_modes_A, non_contracted_modes_B, contracted_modes
+        self.modes_extents_local = {}
+        for mode in self.extent_order_sorted:
+            self.modes_extents_local[mode] = cdiv(self.modes_extents[mode], self.grid_extents[mode])
+    
+    def matches(self, other, modes: str):
+        """
+        Custom equality operator to compare PGrid objects.                
+        """
+        previous_modes = other.tensor_C
+        for i, mode in enumerate(modes):
+            if mode not in other.modes_extents_local:
+                # get matching mode in previous_modes and replace it
+                prev_mode = previous_modes[i]
+                other.grid_extents[mode] = other.modes_extents_local[prev_mode]
+                other.modes_extents_local[mode] = other.modes_extents_local[prev_mode]
+                other.modes_extents[mode] = other.modes_extents[prev_mode]
+                other.extent_order[mode] = other.extent_order[prev_mode]
+                # find index of prev_mode in extent_order_sorted
+                index = other.extent_order_sorted.index(prev_mode)
+                other.extent_order_sorted[index] = mode
+                # add mode to partial_prod
+                other.partial_prod[mode] = other.partial_prod[prev_mode]
+                # remove prev_mode from partial_prod
+                other.partial_prod.pop(prev_mode)
+
+        return all(self.modes_extents_local[mode] == other.modes_extents_local[mode] for mode in modes) \
+        and all(self.extent_order[mode] == other.extent_order[mode] for mode in modes)
+                
+
+    def rank_to_coords(self, p: int = None) -> tuple[int, int, int]:
+        """Convert a rank to its coordinates in the process grid."""
+        if p is None:
+            p = self.p
+        p_remaining = p
+        p_coords = {}
+        for m in self.extent_order_sorted:
+            p_coords[m] = p_remaining // self.partial_prod[m]
+            p_remaining = p_remaining % self.partial_prod[m]
+        return p_coords
+            
+
+
+    def coords_to_rank(self, p_coords:dict[str, int] = None) -> int:
+        """Convert coordinates to rank."""
+        if p_coords is None:
+            p_coords = self.p_coords
+        p = 0
+        for i, mode in enumerate(self.extent_order_sorted):
+            p += p_coords[mode] * self.partial_prod[mode]
+        return p
+
+    
+    def coords_to_global_slice(self, p_coords: dict[str, int] = None) -> dict[str, slice]:
+        """Convert coordinates to slice."""
+        if p_coords is None:
+            p_coords = self.p_coords
+        
+        slices = {}
+        for mode in self.extent_order_sorted:
+            slices[mode] = (p_coords[mode] * self.modes_extents_local[mode], 
+                            (p_coords[mode] + 1) * self.modes_extents_local[mode])
+        return slices
+
+    
+    def element_to_coords(self, x: dict[str, int]) -> int:
+        """Convert global element address, given as a vector x of element indices, 
+        to its owners rank given by the process grid."""
+        owner = {}
+        for mode in self.extent_order_sorted:
+            owner[mode] = x[mode] // self.modes_extents_local[mode]
+        return owner
+    
+    
+    def distribute_input_tensor(self, modes: str, X_global: torch.Tensor = None) -> torch.Tensor:
+        """
+        Extract local input tensor slice given by the modes string.
+        
+        Args:
+            X_global: Input tensor, defined by the modes string
+            modes: String of modes to extract
+            
+        Returns:
+            X_local: Local tensor of shape self.modes_extents_local[mode] for each mode in modes
+        """
+        local_slice = self.coords_to_global_slice()
+        slicer = [slice(None)] * len(modes)  # Full slices for all axes       
+        # slice is a dictionary of slices for each mode
+        # iterate over modes present in X_global
+        for i, mode in enumerate(modes):
+            mode_i_min, mode_i_max = local_slice[mode]
+            # get the slice of the global tensor of the i-th mode
+            slicer[i] = slice(mode_i_min, mode_i_max)
+        tmp = X_global[tuple(slicer)]
+        return X_global[tuple(slicer)]
+
+
+
+        
 
 @dataclass
 class PGrid:
@@ -34,16 +219,25 @@ class PGrid:
     K_local: int
     N_local: int
 
+
     rank_order: tuple[int, int, int]
 
-    def __init__(self, rank: int, P: int, 
+    def __init__(self, 
                  M_global: int, K_global: int, N_global: int, 
-                 rank_order: tuple[int, int, int], grid: tuple[int, int, int] = None):
+                 world_size: int = None,
+                 rank: int = None,
+                 rank_order: tuple[int, int, int] = None,
+                 grid: tuple[int, int, int] = None):
         self.M_global = M_global
         self.K_global = K_global
         self.N_global = N_global
-        self.P = P
+        if world_size is None:
+            world_size = dist.get_world_size()
+        self.P = world_size
+        if rank is None:
+            rank = dist.get_rank()
         self.rank = rank
+        
         if grid is None:
             self.grid = self.find_optimal_grid(M_global, K_global, N_global, P)
         else:
@@ -54,7 +248,10 @@ class PGrid:
         self.K_local = K_global // self.grid[0]
         self.M_local = M_global // self.grid[1]
         self.N_local = N_global // self.grid[2]
-        self.rank_order = rank_order
+        if not rank_order:
+            self.rank_order = (0, 1, 2)
+        else:
+            self.rank_order = rank_order
         self.pk, self.pm, self.pn = self.rank_to_coords()
     
     def matches(self, other):
@@ -232,107 +429,107 @@ class PGrid:
         
 
 
-class DistributedRMSNorm(torch.nn.Module):
-    def __init__(self,
-                    p_grid: PGrid = None,
-                    weight: torch.Tensor = None,
-                    norm_eps: float = 1e-5,
-                    root_layer: bool = False,
-                    device: str = SurrogateConfig.device,
-                    norm_dtype: torch.dtype = SurrogateConfig.norm_dtype,
-                    in_dtype: torch.dtype = SurrogateConfig.in_dtype):
-        super().__init__()
-        self.device = device
-        self.p_grid = p_grid
-        self.norm_dtype = norm_dtype
-        self.in_dtype = in_dtype
-        # counter that will increase by the amount of data communicated over the network each time torch.dist is called
-        self.comm_vol = 0
-        # Initialize process groups for communication
-        self._init_process_groups()
-        # Initialize local weight slice
-        self.init_local_weight_slice(weight, norm_eps)
+# class DistributedRMSNorm(torch.nn.Module):
+#     def __init__(self,
+#                     p_grid: PGrid = None,
+#                     weight: torch.Tensor = None,
+#                     norm_eps: float = 1e-5,
+#                     root_layer: bool = False,
+#                     device: str = SurrogateConfig.device,
+#                     norm_dtype: torch.dtype = SurrogateConfig.norm_dtype,
+#                     in_dtype: torch.dtype = torch.float16):
+#         super().__init__()
+#         self.device = device
+#         self.p_grid = p_grid
+#         self.norm_dtype = norm_dtype
+#         self.in_dtype = in_dtype
+#         # counter that will increase by the amount of data communicated over the network each time torch.dist is called
+#         self.comm_vol = 0
+#         # Initialize process groups for communication
+#         self._init_process_groups()
+#         # Initialize local weight slice
+#         self.init_local_weight_slice(weight, norm_eps)
 
             
 
-    def init_local_weight_slice(self, weight, norm_eps):
-        # Initialize global weight matrix on all ranks
-        self.weight = weight
-        self.norm_eps = norm_eps
+#     def init_local_weight_slice(self, weight, norm_eps):
+#         # Initialize global weight matrix on all ranks
+#         self.weight = weight
+#         self.norm_eps = norm_eps
             
-        # Slice the global weight matrix according to process grid coordinates
-        # Reshape weight to [P_k, K//P_k, P_n, N//P_n]
-        w_reshaped = self.weight.view(self.p_grid.P_n, self.p_grid.N_local)
-        # Get local slice based on process grid coordinates
-        self.weight_local = w_reshaped[self.p_grid.pn]
+#         # Slice the global weight matrix according to process grid coordinates
+#         # Reshape weight to [P_k, K//P_k, P_n, N//P_n]
+#         w_reshaped = self.weight.view(self.p_grid.P_n, self.p_grid.N_local)
+#         # Get local slice based on process grid coordinates
+#         self.weight_local = w_reshaped[self.p_grid.pn]
         
-        # Remove the global weight parameter since we'll only use weight_local
-        del self.weight
+#         # Remove the global weight parameter since we'll only use weight_local
+#         del self.weight
 
 
         
-    def _init_process_groups(self):
-        """Initialize process groups for different communication patterns."""
-        self.reduction_groups = []
+#     def _init_process_groups(self):
+#         """Initialize process groups for different communication patterns."""
+#         self.reduction_groups = []
         
-        # All processes create all groups for all combinations of pm and pn
-        for pk in range(self.p_grid.P_k):
-            for pm in range(self.p_grid.P_m):
-                reduction_ranks = [self.p_grid.coords_to_rank(grid_coords=(pk, pm, pn)) for pn in range(self.p_grid.P_n)]
+#         # All processes create all groups for all combinations of pm and pn
+#         for pk in range(self.p_grid.P_k):
+#             for pm in range(self.p_grid.P_m):
+#                 reduction_ranks = [self.p_grid.coords_to_rank(grid_coords=(pk, pm, pn)) for pn in range(self.p_grid.P_n)]
                 
-                # !!!!!!!!!!!!!!!!!!!!! IMPORTANT !!!!!!!!!!!!!!!!!!!!!
-                # DEBUG ONLY
-                group = reduction_ranks
-                # correct version
-                # group = dist.new_group(reduction_ranks, timeout=datetime.timedelta(seconds=30))
-                # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+#                 # !!!!!!!!!!!!!!!!!!!!! IMPORTANT !!!!!!!!!!!!!!!!!!!!!
+#                 # DEBUG ONLY
+#                 group = reduction_ranks
+#                 # correct version
+#                 # group = dist.new_group(reduction_ranks, timeout=datetime.timedelta(seconds=30))
+#                 # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
                 
-                # Store the group if this process is part of it
-                if self.p_grid.rank in reduction_ranks:
-                    self.reduction_groups.append((group, (pk, pm)))
+#                 # Store the group if this process is part of it
+#                 if self.p_grid.rank in reduction_ranks:
+#                     self.reduction_groups.append((group, (pk, pm)))
 
-    def forward(self, x_local):
-        x_local = x_local.to(dtype=self.norm_dtype)
-        x2_mean_local = x_local.pow(2).mean(-1, keepdim=True) + self.norm_eps
-        # perform allreduce on x2_mean_local
+#     def forward(self, x_local):
+#         x_local = x_local.to(dtype=self.norm_dtype)
+#         x2_mean_local = x_local.pow(2).mean(-1, keepdim=True) + self.norm_eps
+#         # perform allreduce on x2_mean_local
 
-        # dist.barrier()
-        # log(f"\n\nRMSnorm reduction groups: {self.reduction_groups}\ngrid: {self.p_grid}", log_level=DEBUG)
-        # exit()
-        for group, (pk, pm) in self.reduction_groups:
-            if self.p_grid.pm == pm and self.p_grid.pk == pk:
+#         # dist.barrier()
+#         # log(f"\n\nRMSnorm reduction groups: {self.reduction_groups}\ngrid: {self.p_grid}", log_level=DEBUG)
+#         # exit()
+#         for group, (pk, pm) in self.reduction_groups:
+#             if self.p_grid.pm == pm and self.p_grid.pk == pk:
                 
-                # !!!!!!!!!!!!!!!!!!!!! IMPORTANT !!!!!!!!!!!!!!!!!!!!!
-                # DEBUG ONLY
-                # group_ranks = dist.get_process_group_ranks(group)    
-                group_ranks = copy.deepcopy(group)            
-                group = dist.new_group(group, timeout=datetime.timedelta(seconds=30))
+#                 # !!!!!!!!!!!!!!!!!!!!! IMPORTANT !!!!!!!!!!!!!!!!!!!!!
+#                 # DEBUG ONLY
+#                 # group_ranks = dist.get_process_group_ranks(group)    
+#                 group_ranks = copy.deepcopy(group)            
+#                 group = dist.new_group(group, timeout=datetime.timedelta(seconds=30))
                 
-                # correct version - do nothing, use the already created group
-                # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+#                 # correct version - do nothing, use the already created group
+#                 # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 
-                if dist.get_world_size(group) > 1:
-                    # log(f"\n\nx2_mean_local.shape: {x2_mean_local.shape}, type: {x2_mean_local.dtype}", log_level=DEBUG)
-                    # exit()
-                    dist.all_reduce(x2_mean_local, op=dist.ReduceOp.SUM, group=group)
-                    x2_mean_local /= dist.get_world_size(group)
-                    # log(f"Rank {self.grid.rank}: all_reduce comm volume:  {self.comm_vol} += {torch.prod(torch.tensor(y_local.shape))} * 2 * ({dist.get_world_size(group)} - 1)/{dist.get_world_size(group)}",
-                        #  log_level=INFO, ranks=[0])
-                    dist.barrier()
-                    log(f"Rank {self.p_grid.rank}, allreduce within group: {group_ranks}, " +  \
-                        f"reduce buffer size: {torch.prod(torch.tensor(x2_mean_local.shape))}", log_level=DEBUG)
+#                 if dist.get_world_size(group) > 1:
+#                     # log(f"\n\nx2_mean_local.shape: {x2_mean_local.shape}, type: {x2_mean_local.dtype}", log_level=DEBUG)
+#                     # exit()
+#                     dist.all_reduce(x2_mean_local, op=dist.ReduceOp.SUM, group=group)
+#                     x2_mean_local /= dist.get_world_size(group)
+#                     # log(f"Rank {self.grid.rank}: all_reduce comm volume:  {self.comm_vol} += {torch.prod(torch.tensor(y_local.shape))} * 2 * ({dist.get_world_size(group)} - 1)/{dist.get_world_size(group)}",
+#                         #  log_level=INFO, ranks=[0])
+#                     dist.barrier()
+#                     log(f"Rank {self.p_grid.rank}, allreduce within group: {group_ranks}, " +  \
+#                         f"reduce buffer size: {torch.prod(torch.tensor(x2_mean_local.shape))}", log_level=DEBUG)
                         
-                    log(f"result:\n{x2_mean_local.detach().cpu().numpy()}",
-                        log_level=VALUES, ranks=[0])
-                    dist.barrier()
+#                     log(f"result:\n{x2_mean_local.detach().cpu().numpy()}",
+#                         log_level=VALUES, ranks=[0])
+#                     dist.barrier()
             
-                    self.comm_vol += torch.prod(torch.tensor(x2_mean_local.shape)) * 2 * (dist.get_world_size(group) - 1)/dist.get_world_size(group)
+#                     self.comm_vol += torch.prod(torch.tensor(x2_mean_local.shape)) * 2 * (dist.get_world_size(group) - 1)/dist.get_world_size(group)
                                 
-        x_local = x_local * torch.rsqrt(x2_mean_local)
-        out = x_local.to(dtype=self.in_dtype)
+#         x_local = x_local * torch.rsqrt(x2_mean_local)
+#         out = x_local.to(dtype=self.in_dtype)
 
         
-        return out * self.weight_local 
+#         return out * self.weight_local 
 
 
     # def _norm(self, x):
@@ -353,7 +550,7 @@ class Distributed3DLinear(nn.Module):
                   embd_dim: int = 1,
                   hidden_dim: int = 1,
                   root_layer: bool = False,
-                  device: str = SurrogateConfig.device):
+                  device: str = "cuda"):
         super().__init__()
         self.device = device
         self.input_p_grid = input_p_grid
@@ -384,7 +581,7 @@ class Distributed3DLinear(nn.Module):
         
             
 
-    def init_local_weight_slice(self, bias: bool = False, dtype: torch.dtype = SurrogateConfig.weight_dtype):
+    def init_local_weight_slice(self, bias: bool = False, dtype: torch.dtype = torch.float16):
         # Initialize global weight matrix on all ranks
         self.weight = nn.Parameter(torch.empty(self.grid.N_global, self.grid.K_global, device=self.device, dtype=dtype))
         if bias:
@@ -428,7 +625,7 @@ class Distributed3DLinear(nn.Module):
         
         
 
-    def initialize_weight_matrices(self, fixed_init: bool = True, dtype: torch.dtype = SurrogateConfig.weight_dtype):
+    def initialize_weight_matrices(self, fixed_init: bool = True, dtype: torch.dtype = torch.float16):
         """Initialize weights and bias with same values on all ranks."""
         if fixed_init:
             # split X_global accordingly to the distribute_input_tensor function, that is [M//P_m, K//P_k]
@@ -864,7 +1061,7 @@ class Distributed3DLinear(nn.Module):
                                 batch: int = 1, 
                                 seq: int = 1, 
                                 embd: int = 1, 
-                                dtype: torch.dtype = SurrogateConfig.in_dtype) -> torch.Tensor:
+                                dtype: torch.dtype = torch.float16) -> torch.Tensor:
         """
         Distribute input tensor across a 3D process grid.
         

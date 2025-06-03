@@ -12,6 +12,7 @@ from ..distributed import common as dist_ad
 from ..models.factory import ModelFactory
 from ..shim.interface import CachedSequenceInterface
 from ..utils.logger import ad_logger
+from ..utils.node_utils import create_symint_mapping
 from ._graph import canonicalize_graph, lift_to_meta, move_to_device
 from .export import torch_export_to_gm
 from .library import (
@@ -80,7 +81,6 @@ class InferenceOptimizer:
         # INITIALIZE MODEL
         ############################################################################################
         model = self.factory.build_model(device="meta")
-        config = model.config
 
         ############################################################################################
         # EXPORT MODEL TO GRAPH MODULE
@@ -88,6 +88,15 @@ class InferenceOptimizer:
 
         cm.info.set_example_sequence()
         egm = torch_export_to_gm(model, args=cm.args, dynamic_shapes=cm.dynamic_shapes)
+        config = model.config
+        symint_mapping = create_symint_mapping(egm)
+        for i, param in list(cm.dynamic_shapes)[0].items():
+            if "seq_len" in str(param):
+                config.seq_len = symint_mapping[f's{i}']
+            elif "batch" in str(param):
+                config.batch_size = symint_mapping[f's{i}']
+            else:
+                raise ValueError(f"Unknown dynamic shape: {param}")
         del model
         ad_logger.debug("original graph: " + str(egm))
         local_rank, world_size = dist_ad.get_rank_world_size()
@@ -140,7 +149,7 @@ class InferenceOptimizer:
 
         from .library import visualize_graph
 
-        visualize_graph(egm, filename="qwen.svg")
+        # visualize_graph(egm, filename="qwen.svg")
 
         # run TP sharding across ranks
         egm = column_row_shard(egm, local_rank, world_size, self.ad_config.simple_shard_only)
