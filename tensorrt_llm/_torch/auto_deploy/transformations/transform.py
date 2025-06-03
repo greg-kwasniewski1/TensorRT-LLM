@@ -84,6 +84,7 @@ class InferenceOptimizer:
         # INITIALIZE MODEL
         ############################################################################################
         model = self.factory.build_model(device="meta")
+        config = model.config
 
         ############################################################################################
         # EXPORT MODEL TO GRAPH MODULE
@@ -94,6 +95,7 @@ class InferenceOptimizer:
         del model
         ad_logger.debug("original graph: " + str(egm))
         local_rank, world_size = dist_ad.get_rank_world_size()
+        world_size = 16
 
         ############################################################################################
         # RUN PATTERN MATCHER TRANSFORMATIONS TO STANDARDIZE GRAPH REPRESENTATION
@@ -138,7 +140,9 @@ class InferenceOptimizer:
         egm = optimize_rope(egm)
 
         # run TP sharding across ranks
-        egm = column_row_shard(egm, local_rank, world_size, self.ad_config.simple_shard_only)
+        egm = column_row_shard(
+            egm, config, local_rank, world_size, self.ad_config.simple_shard_only
+        )
 
         # run EP sharding across ranks
         egm = ep_shard(egm, local_rank, world_size)

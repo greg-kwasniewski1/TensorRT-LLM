@@ -191,7 +191,7 @@ def _simple_shard(
 
 
 def column_row_shard(
-    gm: GraphModule, rank: int, world_size: int, simple_shard_only: bool = False
+    gm: GraphModule, config, rank: int, world_size: int, simple_shard_only: bool = False
 ) -> GraphModule:
     """A transformation to apply sharding to the model following tensor parallelism.
 
@@ -211,6 +211,13 @@ def column_row_shard(
     if world_size < 2:
         ad_logger.info("Skipping sharding for single device")
         return gm
+
+    # num_heads = config.num_attention_heads
+    # head_dim = config.hidden_size // config.num_attention_heads
+    # if "num_key_value_heads" in config:
+    #     num_kv_heads = config.num_key_value_heads
+    # else:
+    #     num_kv_heads = num_heads
 
     assert isinstance(gm, GraphModule), "Expecting GraphModule"
 
