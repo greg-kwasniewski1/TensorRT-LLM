@@ -187,9 +187,9 @@ class InferenceOptimizer:
         # visualize the final graph
         if self.visualize:
             try:
-                from .library import visualize_namespace
+                from .library import visualize_graph
 
-                visualize_namespace(egm, args=cm.args, dynamic_shapes=cm.dynamic_shapes)
+                visualize_graph(egm, filename="llama3.svg")
                 ad_logger.warning(
                     "Please run `pip install -r examples/auto_deploy/requirements.txt` to visualize"
                     " the graph."

@@ -5,9 +5,12 @@ from typing import Tuple
 
 import model_explorer
 import torch
+import torch.nn as nn
 from model_explorer.graph_builder import GraphNode, KeyValue, MetadataItem
 from model_explorer.pytorch_exported_program_adater_impl import PytorchExportedProgramAdapterImpl
 from torch import fx
+from torch.fx import GraphModule
+from torch.fx.passes.graph_drawer import FxGraphDrawer
 
 from ..export import torch_export
 
@@ -87,3 +90,17 @@ def visualize_namespace(gm: fx.GraphModule, args: Tuple[torch.Tensor, ...], dyna
             n.meta["nn_module_stack"] = n.args[0].meta["nn_module_stack"]
 
     model_explorer.visualize_pytorch("model-viz", ep)
+
+
+def visualize_model(model: nn.Module, filename: str = "model.svg"):
+    gm = torch.fx.symbolic_trace(model)
+    visualize_graph(gm, model.dag, filename)
+
+
+def visualize_graph(gm: GraphModule, filename: str = "graph.svg"):
+    # Use FxGraphDrawer to visualize the graph
+    drawer = FxGraphDrawer(gm, "my_module")
+    dot_graph = drawer.get_dot_graph()
+
+    # Save the modified graph
+    dot_graph.write_svg(filename)
