@@ -710,9 +710,9 @@ def is_aggregation_op(node: Node) -> bool:
 
     elif is_op(node, attention_ops):
         # Attention operations aggregate over sequence dimension
-        # For standard attention layouts: [batch, num_heads, seq_len]
-        # The aggregation happens over seq_len (dimension -1)
-        return ("nonlinear_reduction", -1)  # sequence dimension
+        # For standard attention layouts: [batch, seq_len, embedding]
+        # The aggregation happens over seq_len (dimension 1)
+        return ("nonlinear_reduction", 1)  # sequence dimension
 
     else:
         return False

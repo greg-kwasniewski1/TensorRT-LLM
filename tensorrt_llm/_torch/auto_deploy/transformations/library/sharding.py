@@ -454,16 +454,8 @@ def distribute_3d(gm: GraphModule, rank: int, world_size: int, config) -> GraphM
             else:
                 raise ValueError(f"Node {n} has no args or users")
 
-        # figure out the tensor shape as an einsum string
-        if tensor_meta is not None:
-            einsum_str = shape_to_einsum(tensor_meta.shape)
-        else:
-            einsum_str = "u"  # u for unknown
-
-        dist_tensor = DistributedTensor(modes_extents, einsum_str)
-        n.meta["dist_tensor"] = dist_tensor
-
         if is_linear_op(n, include_quantization=True):
+            # find the input distribution
             prev = bfs(
                 n,
                 # lambda x: is_aggregation_op(x),
@@ -477,6 +469,8 @@ def distribute_3d(gm: GraphModule, rank: int, world_size: int, config) -> GraphM
                 prev_rank_order = input_p_grid.rank_order
             else:
                 prev_rank_order = (2, 1, 0)
+            
+            # find the required output distribution
             successor = bfs(
                 n,
                 lambda x: is_aggregation_op(x),
@@ -489,13 +483,41 @@ def distribute_3d(gm: GraphModule, rank: int, world_size: int, config) -> GraphM
                 op, dim = is_aggregation_op(successor)
             if dim is not None:
                 pass
+
+            # Find the contraction einsum string
+            # We assume that the linear node performs contraction:
+            # Y = X @ W^T
+            # defined by the einsum string:
+            # bse, ef -> bsf
+            # the mode extent f differs depending on the layer:
+            # for MLP, that is the intermediate size (mlp_dim)
+            # for standard attention, Q and Out projections that is the embedding size (embd)
+            # for the key and value projections, that is the embedding size (embd)
+            # for the output, that is the embedding size (embd)
+            # for the input, that is the embedding size (embd)
+            # for the key, that is the embedding size (embd)
+            # for the value, that is the embedding size (embd)
+            # for the query, that is the embedding size (embd)
+
             n.meta["p_grid"] = PGrid(
                 M_global=batch_size * seq_len,
                 N_global=embd,
                 K_global=embd,
                 world_size=world_size,
                 rank_order=(prev_rank_order[2], prev_rank_order[1], prev_rank_order[0]),
+                nonparallelizable_dim=dim,
             )
+
+            
+        # figure out the tensor shape as an einsum string
+        if tensor_meta is not None:
+            einsum_str = shape_to_einsum(tensor_meta.shape)
+        else:
+            einsum_str = "u"  # u for unknown
+
+        dist_tensor = DistributedTensor(modes_extents, einsum_str)
+        n.meta["dist_tensor"] = dist_tensor
+
 
     linear_layers = [n for n in gm.graph.nodes if is_linear_op(n)]
     aggregation_nodes = [n for n in gm.graph.nodes if is_aggregation_op(n)]

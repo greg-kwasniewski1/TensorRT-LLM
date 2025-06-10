@@ -5,7 +5,6 @@ import gc
 import torch
 from torch.fx import GraphModule
 
-from ....llmapi.llm_args import _AutoDeployLlmArgs
 from ..compile import compile_and_capture
 from ..custom_ops.attention_interface import AttentionRegistry
 from ..distributed import common as dist_ad
@@ -22,6 +21,7 @@ from .library import (
     ep_shard,
     fuse_allreduce_residual_rmsnorm,
     fuse_collectives,
+    fuse_moe,
     insert_cached_attention,
     match_attention_layout,
     match_causal_attn_mask,
@@ -43,10 +43,12 @@ class InferenceOptimizer:
         self,
         factory: ModelFactory,
         *,  # TODO: temporary until we have a better config system
-        ad_config: _AutoDeployLlmArgs,
+        ad_config,
         visualize: bool = False,
     ):
         self.factory = factory
+        self.attn_backend = ad_config.attn_backend
+        self.mla_backend = ad_config.mla_backend
 
         self.ad_config = ad_config
         # Map Pytorch config to AutoDeploy compile backends.
@@ -60,6 +62,10 @@ class InferenceOptimizer:
             compile_backend = "torch-simple"
         self.compile_backend = compile_backend
         self.visualize = visualize
+
+        # look up attention op
+        self.attention_op = AttentionRegistry.get(self.attn_backend)
+        self.mla_op = AttentionRegistry.get(self.mla_backend)
 
     def __call__(self, cm: CachedSequenceInterface) -> GraphModule:
         """Transform a model into an optimized inference model.
@@ -126,15 +132,13 @@ class InferenceOptimizer:
         egm = match_causal_attn_mask(egm)
 
         # Match attention layout expected by our backend
-        egm = match_attention_layout(egm, AttentionRegistry.get(self.ad_config.attn_backend))
+        egm = match_attention_layout(egm, self.attention_op)
 
         # Match rope
         egm, _ = match_rope_pattern(egm)
 
         # Match RoPE layout expected by our backend
-        egm = match_rope_layout(
-            egm, AttentionRegistry.get(self.ad_config.attn_backend).get_attention_layout()
-        )
+        egm = match_rope_layout(egm, self.attention_op.get_attention_layout())
 
         ############################################################################################
         # RUN TRANSFORMATIONS ON STANDARDIZED GRAPH REPRESENTATION
@@ -150,7 +154,8 @@ class InferenceOptimizer:
         visualize_graph(egm, filename="qwen_before_sharding.svg")
 
         # run TP sharding across ranks
-        egm = column_row_shard(egm, local_rank, world_size, self.ad_config.simple_shard_only)
+        # egm = column_row_shard(egm, local_rank, world_size)
+        egm = distribute_3d(egm, local_rank, world_size, config)
 
         # run EP sharding across ranks
         egm = ep_shard(egm, local_rank, world_size)
@@ -180,11 +185,10 @@ class InferenceOptimizer:
         ############################################################################################
 
         # run MoE fusion
-        # TODO: https://github.com/NVIDIA/TensorRT-LLM/issues/4674 this is causing OOMs
-        # egm = fuse_moe(egm)
+        egm = fuse_moe(egm)
 
         # run GEMM fusion
-        # TODO: https://github.com/NVIDIA/TensorRT-LLM/issues/4674 this is causing OOMs
+        # TODO: this is causing OOMs, so we're disabling it for now
         # egm = fuse_gemms(egm)
 
         # check if we can fuse allreduce, residual and rmsnorm
@@ -213,8 +217,7 @@ class InferenceOptimizer:
         egm = update_in_out_nodes(egm, cm)
 
         # detect attention op and replace with cache-aware op
-        for a_backend in [self.ad_config.attn_backend, self.ad_config.mla_backend]:
-            attn_descriptor = AttentionRegistry.get(a_backend)
+        for attn_descriptor in [self.attention_op, self.mla_op]:
             egm = insert_cached_attention(egm, cm, attn_descriptor, self.factory.get_cache_config())
 
         # initialize cache on correct device
