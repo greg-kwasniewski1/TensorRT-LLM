@@ -65,3 +65,8 @@ CMakeUserPresets.json
 compile_commands.json
 *.bin
 .dir-locals.el
+
+# Ignore documentation and configuration files
+*.svg
+*.md
+*.yaml

@@ -25,19 +25,19 @@ import torch
 import torch.nn as nn
 from torch.fx import GraphModule, Node
 
+from ...distributed.distributed_classes import DistributedTensor, PGrid
 from ...utils.logger import ad_logger
 from ...utils.node_utils import (
+    bfs,
     extract_param_names_from_lin_node,
     identify_regions_between_residuals,
+    is_aggregation_op,
     is_linear_op,
-    is_dist_op,
     is_op,
     num_users_of_weight_node,
-    bfs
 )
 from ...utils.quantization_utils import QuantizationImpl
 from .._graph import canonicalize_graph
-from ...distributed.distributed_classes import *
 
 
 def _load_hook(
@@ -335,9 +335,6 @@ def column_row_shard(
     return gm
 
 
-
-
-
 def distribute_3d(gm: GraphModule, rank: int, world_size: int, config) -> GraphModule:
     ad_logger.debug("Before sharding graph: " + str(gm))
 
@@ -360,7 +357,15 @@ def distribute_3d(gm: GraphModule, rank: int, world_size: int, config) -> GraphM
         mlp_dim = config.intermediate_size
     vocab_size = config.vocab_size
     kv_dim = embd * num_kv_heads // num_heads
-    
+    if "q_lora_rank" in config:
+        q_lora_rank = config.q_lora_rank
+    else:
+        q_lora_rank = -1
+    if "kv_lora_rank" in config:
+        kv_lora_rank = config.kv_lora_rank
+    else:
+        kv_lora_rank = -1
+
     modes_extents = {
         "b": batch_size,
         "s": seq_len,
@@ -373,6 +378,8 @@ def distribute_3d(gm: GraphModule, rank: int, world_size: int, config) -> GraphM
         "n": num_kv_heads,
         "k": kv_dim,
         "P": world_size,
+        "q": q_lora_rank,
+        "l": kv_lora_rank,
     }
 
     def shape_to_einsum(fake_tensor_shape: torch.Size) -> str:
@@ -411,67 +418,122 @@ def distribute_3d(gm: GraphModule, rank: int, world_size: int, config) -> GraphM
                 einsum_str += "b"
             elif dim == kv_dim:
                 einsum_str += "k"
+            elif dim == q_lora_rank:
+                einsum_str += "q"
+            elif dim == kv_lora_rank:
+                einsum_str += "l"
             else:
                 einsum_str += "u"
                 ad_logger.debug(f"Unknown dimension: {dim}")
-            
+
         return einsum_str
 
+    import copy
+
+    seq_len_copy = copy.deepcopy(seq_len)
+    a = 1
     # first pass over nodes - assign dist_tensor to each node
     for n in gm.graph.nodes:
         # infer data shapes
         # if tensor_meta is available, use it to infer the shape
-        if 'tensor_meta' in n.meta:
-            tensor_meta = n.meta['tensor_meta']
+        if "tensor_meta" in n.meta:
+            tensor_meta = n.meta["tensor_meta"]
         else:
             # get it from parent or child node
             if len(n.args) > 0:
                 parent_node = n.args[0]
                 if isinstance(parent_node, tuple):
                     parent_node = parent_node[0]
-                if 'tensor_meta' not in parent_node.meta:
+                if "tensor_meta" not in parent_node.meta:
                     tensor_meta = None
                 else:
-                    tensor_meta = parent_node.meta['tensor_meta']
+                    tensor_meta = parent_node.meta["tensor_meta"]
             elif len(n.users) > 0:
                 child_node = list(n.users)[0]
-                tensor_meta = child_node.meta['tensor_meta']
+                tensor_meta = child_node.meta["tensor_meta"]
             else:
                 raise ValueError(f"Node {n} has no args or users")
-        
+
         # figure out the tensor shape as an einsum string
         if tensor_meta is not None:
             einsum_str = shape_to_einsum(tensor_meta.shape)
         else:
-            einsum_str = 'u' # u for unknown
+            einsum_str = "u"  # u for unknown
+
         dist_tensor = DistributedTensor(modes_extents, einsum_str)
-        n.meta['dist_tensor'] = dist_tensor
+        n.meta["dist_tensor"] = dist_tensor
+
+        if is_linear_op(n, include_quantization=True):
+            prev = bfs(
+                n,
+                # lambda x: is_aggregation_op(x),
+                lambda x: is_linear_op(x),
+                attr_next="args",
+                skip_root=True,
+                allow_empty=True,
+            )
+            if prev is not None:
+                input_p_grid = prev.meta["p_grid"]
+                prev_rank_order = input_p_grid.rank_order
+            else:
+                prev_rank_order = (2, 1, 0)
+            successor = bfs(
+                n,
+                lambda x: is_aggregation_op(x),
+                attr_next="users",
+                skip_root=True,
+                allow_empty=True,
+            )
+            dim = None
+            if successor is not None:
+                op, dim = is_aggregation_op(successor)
+            if dim is not None:
+                pass
+            n.meta["p_grid"] = PGrid(
+                M_global=batch_size * seq_len,
+                N_global=embd,
+                K_global=embd,
+                world_size=world_size,
+                rank_order=(prev_rank_order[2], prev_rank_order[1], prev_rank_order[0]),
+            )
 
     linear_layers = [n for n in gm.graph.nodes if is_linear_op(n)]
-    def find_previous_linear_node(n: Node) -> Node:
-        for prev_node in n.all_input_nodes:
-            if is_linear_op(prev_node):
-                return prev_node
-        return None
-
-
-
+    aggregation_nodes = [n for n in gm.graph.nodes if is_aggregation_op(n)]
 
     # second pass over nodes - find all linear nodes and assign distributed computation grid PGrid to each node
     for n in gm.graph.nodes:
         if is_linear_op(n, include_quantization=True):
-            prev_linear = bfs(n, 
-                              lambda x: is_linear_op(x, include_quantization=True) or is_dist_op(x), 
-                              attr_next = "args", 
-                              skip_root=True, allow_empty=True)
-            if prev_linear is not None:
-
-            n.meta['p_grid'] = PGrid(M_global=batch_size*seq_len,
-                                     N_global=embd,
-                                     K_global=embd,
-                                     P_m=world_size,
-                                     rank_order=(0, 1, 2))
-
+            prev = bfs(
+                n,
+                lambda x: is_aggregation_op(x),
+                attr_next="args",
+                skip_root=True,
+                allow_empty=True,
+            )
+            if prev is not None:
+                input_p_grid = prev.meta["p_grid"]
+                prev_rank_order = input_p_grid.rank_order
+            else:
+                prev_rank_order = (2, 1, 0)
+            successor = bfs(
+                n,
+                lambda x: is_aggregation_op(x),
+                attr_next="users",
+                skip_root=True,
+                allow_empty=True,
+            )
+            dim = None
+            if successor is not None:
+                op, dim = is_aggregation_op(successor)
+            if dim is not None:
+                pass
+            n.meta["p_grid"] = PGrid(
+                M_global=batch_size * seq_len,
+                N_global=embd,
+                K_global=embd,
+                world_size=world_size,
+                rank_order=(prev_rank_order[2], prev_rank_order[1], prev_rank_order[0]),
+            )
 
     # TODO: continue updating these lists
     # pointwise ops that don't affect the sharder

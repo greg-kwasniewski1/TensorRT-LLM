@@ -230,13 +230,33 @@ def is_linear_op(node: Node, include_quantization: bool = False) -> bool:
     return is_op(node, lin_ops)
 
 
+def is_nonlinear_reduction_op(node: Node, include_quantization: bool = False) -> bool:
+    """Check if the node is a nonlinear reduction op.
+
+    Using this function is preferred over `is_op` for linear ops to ensure all variants are covered.
+    """
+    lin_ops = {
+        torch.ops.aten.mean,
+        torch.ops.aten.sum,
+        torch.ops.aten.max,
+        torch.ops.aten.min,
+        torch.ops.aten.amax,
+        torch.ops.aten.amin,
+        torch.ops.aten.norm,
+        torch.ops.aten.std,
+        torch.ops.attention.scaled_dot_product_attention,
+        torch.ops.attention.grouped_sdpa,
+        torch.ops.attention.bsnd_grouped_sdpa,
+    }
+
+    if include_quantization:
+        lin_ops.update(QUANT_OPS)
+    return is_op(node, lin_ops)
+
+
 def is_dist_op(node: Node) -> bool:
     """Check if the node is a distributed op."""
-    dist_ops = {
-        torch.ops.dist.all_gather,
-        torch.ops.dist.all_reduce,
-        torch.ops.dist.P2POp
-    }
+    dist_ops = {torch.ops.dist.all_gather, torch.ops.dist.all_reduce, torch.distributed.P2POp}
     return is_op(node, dist_ops)
 
 
@@ -315,10 +335,12 @@ def identify_regions_between_residuals(gm: GraphModule) -> List[Node]:
 
 
 def bfs(
-    node: Node, target: Callable, attr_next: str = "users", 
-    boundary: Optional[Node] = None, 
-    skip_root = False,
-    allow_empty = False,
+    node: Node,
+    target: Callable,
+    attr_next: str = "users",
+    boundary: Optional[Node] = None,
+    skip_root=False,
+    allow_empty=False,
 ) -> Node:
     queue = [node]
     visited = set()
@@ -342,8 +364,6 @@ def bfs(
     if allow_empty:
         return None
     raise RuntimeError(f"Could not find node with target condition {target}.")
-
-
 
 
 def bfs_(
@@ -425,23 +445,445 @@ def extract_op_args(node: Node, *arg_names):
     return [_get(n) for n in arg_names]
 
 
-
-
 def create_symint_mapping(gm: GraphModule):
     """Create a mapping from SymInt expressions to their corresponding nodes."""
     symint_to_node = {}
-    
+
     for node in gm.graph.nodes:
         if node.op == "placeholder":
             # Check if the node itself is a SymInt
             if isinstance(node.meta.get("val"), torch.SymInt):
                 symint_to_node[str(node.meta["val"])] = node
-            
+
             # Check tensor shapes for SymInt dimensions
-            elif hasattr(node.meta.get("val"), 'shape'):
+            elif hasattr(node.meta.get("val"), "shape"):
                 fake_tensor = node.meta["val"]
                 for dim_idx, dim_size in enumerate(fake_tensor.shape):
                     if isinstance(dim_size, torch.SymInt):
                         symint_to_node[str(dim_size)] = dim_size
-    
+
     return symint_to_node
+
+
+def classify_operation_type(node: Node) -> Tuple[str, Optional[int]]:
+    """
+    Classify a PyTorch FX node into operation categories for sharding purposes.
+
+    Returns:
+        Tuple[str, Optional[int]]: (operation_type, aggregation_dimension)
+        - operation_type: 'pointwise', 'linear', or 'nonlinear_reduction'
+        - aggregation_dimension: For nonlinear operations, the dimension that's being aggregated over
+    """
+
+    if not isinstance(node, Node) or node.op != "call_function":
+        return ("unknown", None)
+
+    # Category A: Pointwise Operations
+    pointwise_ops = {
+        # Element-wise arithmetic
+        torch.ops.aten.add,
+        torch.ops.aten.add_,
+        torch.ops.aten.sub,
+        torch.ops.aten.sub_,
+        torch.ops.aten.mul,
+        torch.ops.aten.mul_,
+        torch.ops.aten.div,
+        torch.ops.aten.div_,
+        torch.ops.aten.pow,
+        torch.ops.aten.pow_,
+        # Element-wise functions
+        torch.ops.aten.relu,
+        torch.ops.aten.relu_,
+        torch.ops.aten.gelu,
+        torch.ops.aten.gelu_approximate,
+        torch.ops.aten.silu,
+        torch.ops.aten.silu_,
+        torch.ops.aten.tanh,
+        torch.ops.aten.tanh_,
+        torch.ops.aten.sigmoid,
+        torch.ops.aten.sigmoid_,
+        torch.ops.aten.exp,
+        torch.ops.aten.exp_,
+        torch.ops.aten.sin,
+        torch.ops.aten.cos,
+        torch.ops.aten.abs,
+        torch.ops.aten.sqrt,
+        torch.ops.aten.log,
+        torch.ops.aten.log_,
+        torch.ops.aten.rsqrt,
+        torch.ops.aten.neg,
+        # Element-wise comparisons
+        torch.ops.aten.eq,
+        torch.ops.aten.ne,
+        torch.ops.aten.lt,
+        torch.ops.aten.le,
+        torch.ops.aten.gt,
+        torch.ops.aten.ge,
+        # Element-wise logical
+        torch.ops.aten.logical_and,
+        torch.ops.aten.logical_or,
+        torch.ops.aten.logical_not,
+        torch.ops.aten.logical_xor,
+        # Shape manipulations (no computation)
+        torch.ops.aten.view,
+        torch.ops.aten.reshape,
+        torch.ops.aten.transpose,
+        torch.ops.aten.permute,
+        torch.ops.aten.squeeze,
+        torch.ops.aten.unsqueeze,
+        torch.ops.aten.contiguous,
+        torch.ops.aten.flatten,
+        # Element-wise conversions
+        torch.ops.aten.to,
+        torch.ops.aten.type_as,
+        torch.ops.aten.clone,
+        torch.ops.aten.detach,
+        # Activation functions
+        torch.ops.aten.leaky_relu,
+        torch.ops.aten.elu,
+        torch.ops.aten.hardtanh,
+        torch.ops.aten.hardswish,
+    }
+
+    # Category B: Linear Operations (Matrix/Tensor Contractions)
+    linear_ops = {
+        torch.ops.aten.linear,
+        torch.ops.linear.simple,
+        torch.ops.aten.matmul,
+        torch.ops.aten.mm,
+        torch.ops.aten.bmm,
+        torch.ops.aten.addmm,
+        torch.ops.aten.baddbmm,
+        torch.ops.aten.addmv,
+        torch.ops.aten.mv,
+        torch.ops.aten.dot,
+        torch.ops.aten.conv1d,
+        torch.ops.aten.conv2d,
+        torch.ops.aten.conv3d,
+        torch.ops.aten.conv_transpose1d,
+        torch.ops.aten.conv_transpose2d,
+        torch.ops.aten.embedding,
+        torch.ops.aten.embedding_bag,
+    }
+
+    # Category C: Nonlinear Reduction Operations
+    # We need to analyze both the operation and its dimension parameter
+    nonlinear_reduction_ops = {
+        # Reduction operations - need to check 'dim' parameter
+        torch.ops.aten.mean,
+        torch.ops.aten.sum,
+        torch.ops.aten.max,
+        torch.ops.aten.min,
+        torch.ops.aten.amax,
+        torch.ops.aten.amin,
+        torch.ops.aten.std,
+        torch.ops.aten.var,
+        torch.ops.aten.norm,
+        torch.ops.aten.linalg_norm,
+        torch.ops.aten.prod,
+        torch.ops.aten.any,
+        torch.ops.aten.all,
+        # Normalization operations - aggregate over specific dimensions
+        torch.ops.aten.layer_norm,
+        torch.ops.aten.group_norm,
+        torch.ops.aten.batch_norm,
+        torch.ops.aten.instance_norm,
+        torch.ops.aten.rms_norm,  # if available
+        # Softmax and related - aggregate over specific dimensions
+        torch.ops.aten.softmax,
+        torch.ops.aten.log_softmax,
+        torch.ops.aten.gumbel_softmax,
+    }
+
+    # Attention operations - special case (aggregate over sequence dimension)
+    attention_ops = {
+        torch.ops.attention.scaled_dot_product_attention,
+        torch.ops.attention.grouped_sdpa,
+        torch.ops.attention.bsnd_grouped_sdpa,
+    }
+
+    # Check operation type
+    if node.target in pointwise_ops:
+        return ("pointwise", None)
+
+    elif node.target in linear_ops:
+        return ("linear", None)
+
+    elif node.target in nonlinear_reduction_ops:
+        # Extract the aggregation dimension
+        agg_dim = _extract_aggregation_dimension(node)
+        return ("nonlinear_reduction", agg_dim)
+
+    elif node.target in attention_ops:
+        # Attention operations aggregate over sequence dimension
+        # For standard attention layouts: [batch, num_heads, seq_len, head_dim]
+        # The aggregation happens over seq_len (dimension -2 or 2)
+        return ("nonlinear_reduction", -2)  # sequence dimension
+
+    else:
+        return ("unknown", None)
+
+
+def is_aggregation_op(node: Node) -> bool:
+    """
+    Classify a PyTorch FX node into operation categories for sharding purposes.
+
+    Mode dimension convention:
+    We always assume that tensor X is of shape [batch, sequence, embedding].
+    Therfore, 0 = batch, 1 = sequence, 2 = embedding.
+
+    Returns:
+        Tuple[str, Optional[int]]: (operation_type, aggregation_dimension)
+        - operation_type: 'pointwise', 'linear', or 'nonlinear_reduction'
+        - aggregation_dimension: For nonlinear operations, the dimension that's being aggregated over
+    """
+
+    if not isinstance(node, Node) or node.op != "call_function":
+        return False
+
+    # Category B: Linear Operations (Matrix/Tensor Contractions)
+    linear_ops = {
+        torch.ops.aten.linear,
+        torch.ops.linear.simple,
+        torch.ops.aten.matmul,
+        torch.ops.aten.mm,
+        torch.ops.aten.bmm,
+        torch.ops.aten.addmm,
+        torch.ops.aten.baddbmm,
+        torch.ops.aten.addmv,
+        torch.ops.aten.mv,
+        torch.ops.aten.dot,
+        torch.ops.aten.conv1d,
+        torch.ops.aten.conv2d,
+        torch.ops.aten.conv3d,
+        torch.ops.aten.conv_transpose1d,
+        torch.ops.aten.conv_transpose2d,
+        torch.ops.aten.embedding,
+        torch.ops.aten.embedding_bag,
+    }
+
+    # Category C: Nonlinear Reduction Operations
+    # We need to analyze both the operation and its dimension parameter
+    nonlinear_reduction_ops = {
+        # Reduction operations - need to check 'dim' parameter
+        torch.ops.aten.mean,
+        torch.ops.aten.sum,
+        torch.ops.aten.max,
+        torch.ops.aten.min,
+        torch.ops.aten.amax,
+        torch.ops.aten.amin,
+        torch.ops.aten.std,
+        torch.ops.aten.var,
+        torch.ops.aten.norm,
+        torch.ops.aten.linalg_norm,
+        torch.ops.aten.prod,
+        torch.ops.aten.any,
+        torch.ops.aten.all,
+        # Normalization operations - aggregate over specific dimensions
+        torch.ops.aten.layer_norm,
+        torch.ops.aten.group_norm,
+        torch.ops.aten.batch_norm,
+        torch.ops.aten.instance_norm,
+        torch.ops.aten.rms_norm,  # if available
+        # Softmax and related - aggregate over specific dimensions
+        torch.ops.aten.softmax,
+        torch.ops.aten.log_softmax,
+        torch.nn.functional.gumbel_softmax,
+    }
+
+    # Attention operations - special case (aggregate over sequence dimension)
+    attention_ops = {
+        torch.ops.attention.scaled_dot_product_attention,
+        torch.ops.attention.grouped_sdpa,
+        torch.ops.attention.bsnd_grouped_sdpa,
+    }
+
+    if is_op(node, linear_ops):
+        return ("linear", None)
+
+    elif is_op(node, nonlinear_reduction_ops):
+        # Extract the aggregation dimension
+        agg_dim = _extract_aggregation_dimension(node)
+        if isinstance(agg_dim, Iterable):
+            agg_dim = agg_dim[0]
+        return ("nonlinear_reduction", agg_dim)
+
+    elif is_op(node, attention_ops):
+        # Attention operations aggregate over sequence dimension
+        # For standard attention layouts: [batch, num_heads, seq_len]
+        # The aggregation happens over seq_len (dimension -1)
+        return ("nonlinear_reduction", -1)  # sequence dimension
+
+    else:
+        return False
+
+
+def _extract_aggregation_dimension(node: Node) -> Optional[int]:
+    """Extract the dimension being aggregated over for reduction operations."""
+
+    # Common parameter names for reduction dimension
+    dim_param_names = ["dim", "axis", "dims", "axes"]
+
+    # Check args first (positional parameters)
+    if is_op(node, {torch.ops.aten.softmax, torch.ops.aten.log_softmax}):
+        # For softmax: softmax(input, dim, dtype=None)
+        if len(node.args) >= 2:
+            return node.args[1]
+
+    elif is_op(
+        node,
+        {
+            torch.ops.aten.mean,
+            torch.ops.aten.sum,
+            torch.ops.aten.max,
+            torch.ops.aten.min,
+            torch.ops.aten.std,
+            torch.ops.aten.var,
+        },
+    ):
+        # For reductions: mean(input, dim=None, keepdim=False, *, dtype=None)
+        if len(node.args) >= 2:
+            return node.args[1]
+
+    elif is_op(node, torch.ops.aten.layer_norm):
+        # LayerNorm normalizes over the last N dimensions
+        # layer_norm(input, normalized_shape, weight=None, bias=None, eps=1e-05)
+        if len(node.args) >= 2:
+            normalized_shape = node.args[1]
+            if isinstance(normalized_shape, (list, tuple)):
+                # Aggregates over the last len(normalized_shape) dimensions
+                return list(range(-len(normalized_shape), 0))
+            elif isinstance(normalized_shape, int):
+                # Aggregates over the last dimension
+                return -1
+
+    # Check kwargs
+    for param_name in dim_param_names:
+        if param_name in node.kwargs:
+            return node.kwargs[param_name]
+
+    # Default heuristics based on operation type
+    if node.target in {torch.ops.aten.softmax, torch.ops.aten.log_softmax}:
+        return -1  # Usually applied to last dimension
+
+    elif node.target == torch.ops.aten.layer_norm:
+        return -1  # Usually normalizes embedding dimension
+
+    elif node.target == torch.ops.aten.batch_norm:
+        return 1  # Usually normalizes channel dimension
+
+    return None
+
+
+def analyze_sharding_constraints(node: Node) -> dict[str, any]:
+    """
+    Analyze sharding constraints for a given operation.
+
+    Returns a dictionary with sharding recommendations.
+    """
+    op_type, agg_dim = classify_operation_type(node)
+
+    constraints = {
+        "operation_type": op_type,
+        "aggregation_dimension": agg_dim,
+        "sharding_recommendation": None,
+        "communication_pattern": None,
+        "parallelizable_dimensions": None,
+    }
+
+    if op_type == "pointwise":
+        constraints.update(
+            {
+                "sharding_recommendation": "Can be sharded along any dimension",
+                "communication_pattern": "No communication required",
+                "parallelizable_dimensions": "all",
+            }
+        )
+
+    elif op_type == "linear":
+        constraints.update(
+            {
+                "sharding_recommendation": "Shard to minimize communication volume",
+                "communication_pattern": "All-reduce on output or weight gathering",
+                "parallelizable_dimensions": _analyze_linear_parallelization(node),
+            }
+        )
+
+    elif op_type == "nonlinear_reduction":
+        forbidden_dims = (
+            agg_dim if isinstance(agg_dim, list) else [agg_dim] if agg_dim is not None else []
+        )
+        constraints.update(
+            {
+                "sharding_recommendation": f"Do NOT shard along dimensions {forbidden_dims}",
+                "communication_pattern": "All-reduce before operation",
+                "parallelizable_dimensions": f"all except {forbidden_dims}",
+                "forbidden_sharding_dimensions": forbidden_dims,
+            }
+        )
+
+    return constraints
+
+
+def _analyze_linear_parallelization(node: Node) -> dict[str, str]:
+    """Analyze how linear operations can be parallelized."""
+    if node.target in {torch.ops.aten.linear, torch.ops.linear.simple}:
+        return {
+            "input_batch_dim": "parallelizable",
+            "input_feature_dim": "requires all-gather or weight replication",
+            "weight_input_dim": "requires all-gather or input replication",
+            "weight_output_dim": "parallelizable (column parallel)",
+            "output_batch_dim": "inherits from input",
+            "output_feature_dim": "requires all-reduce if weight is column-parallel",
+        }
+
+    elif node.target in {torch.ops.aten.matmul, torch.ops.aten.mm, torch.ops.aten.bmm}:
+        return {
+            "matrix_a_batch": "parallelizable",
+            "matrix_a_rows": "parallelizable",
+            "matrix_a_cols": "requires synchronization with matrix_b_rows",
+            "matrix_b_rows": "requires synchronization with matrix_a_cols",
+            "matrix_b_cols": "parallelizable",
+            "output": "requires all-reduce if inner dimension is sharded",
+        }
+
+    return {}
+
+
+# Example usage function
+def get_sharding_strategy(node: Node) -> str:
+    """Get a high-level sharding strategy recommendation."""
+    op_type, agg_dim = classify_operation_type(node)
+
+    if op_type == "pointwise":
+        return "REPLICATE_COMPUTATION - can distribute along any dimension"
+
+    elif op_type == "linear":
+        return "TENSOR_PARALLEL - use row/column parallelism with communication"
+
+    elif op_type == "nonlinear_reduction":
+        if agg_dim == -1:  # embedding/feature dimension
+            return "NO_SHARD_EMBEDDING - do not distribute embedding dimension"
+        elif agg_dim == -2:  # sequence dimension
+            return "NO_SHARD_SEQUENCE - do not distribute sequence dimension"
+        else:
+            return f"NO_SHARD_DIM_{agg_dim} - do not distribute dimension {agg_dim}"
+
+    return "ANALYZE_MANUALLY - unknown operation type"
+
+
+def analyze_attention_sharding(node: Node) -> dict[str, str]:
+    """Specific analysis for attention operations."""
+    if node.target in {
+        torch.ops.attention.scaled_dot_product_attention,
+        torch.ops.attention.grouped_sdpa,
+        torch.ops.attention.bsnd_grouped_sdpa,
+    }:
+        return {
+            "batch_dimension": "parallelizable",
+            "num_heads_dimension": "parallelizable",
+            "sequence_dimension": "DO NOT SHARD - breaks attention semantics",
+            "head_dimension": "parallelizable with all-reduce",
+            "recommendation": "Use sequence-parallel only with specialized attention kernels",
+        }
+    return {}
