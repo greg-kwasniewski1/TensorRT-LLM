@@ -153,6 +153,10 @@ class AutoModelForCausalLMFactory(ModelFactory):
         # we want to recursively update model_config from model_kwargs here.
         model_config = self.autoconfig_from_pretrained(self.model, trust_remote_code=True)
         model_config = self._recursive_update_config(model_config, self.model_kwargs)
+        if "text_config" in model_config:
+            model_config = model_config.text_config
+            model_config.num_hidden_layers = 3
+            model_config.num_local_experts = 8
 
         with (init_empty_weights if device == "meta" else nullcontext)():
             model = self.automodel_from_config(model_config, trust_remote_code=True)

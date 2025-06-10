@@ -15,6 +15,7 @@ from ..utils.node_utils import create_symint_mapping
 from ._graph import canonicalize_graph, lift_to_meta, move_to_device
 from .export import torch_export_to_gm
 from .library import (
+    column_row_shard,
     distribute_3d,
     dp_bmm_shard,
     eliminate_redundant_transposes,
@@ -37,6 +38,32 @@ from .library import (
     update_in_out_nodes,
 )
 
+from torch.utils._pytree import register_pytree_node
+from transformers.cache_utils import HybridChunkedCache
+
+# Register HybridChunkedCache as a PyTree type
+def hybrid_cache_flatten(cache):
+    """Flatten HybridChunkedCache into a format that can be handled by PyTorch's export."""
+    attrs = {}
+    for key, value in cache.__dict__.items():
+        if hasattr(value, 'shape'):  # If it's a tensor-like object
+            attrs[key] = value
+    return (attrs,), None
+
+def hybrid_cache_unflatten(aux_data, children):
+    """Reconstruct HybridChunkedCache from flattened data."""
+    attrs, = children
+    cache = HybridChunkedCache()
+    for key, value in attrs.items():
+        setattr(cache, key, value)
+    return cache
+
+# Register the type
+register_pytree_node(
+    HybridChunkedCache,
+    hybrid_cache_flatten,
+    hybrid_cache_unflatten
+)
 
 class InferenceOptimizer:
     def __init__(
@@ -151,15 +178,15 @@ class InferenceOptimizer:
         # see https://github.com/NVIDIA/TensorRT-LLM/pull/3668#discussion_r2052714528
         egm = optimize_rope(egm)
 
-        visualize_graph(egm, filename="qwen_before_sharding.svg")
+        visualize_graph(egm, filename="llama_4_before_sharding.svg")
 
         # run TP sharding across ranks
-        # egm = column_row_shard(egm, local_rank, world_size)
-        egm = distribute_3d(egm, local_rank, world_size, config)
+        egm = column_row_shard(egm, local_rank, world_size)
+        # egm = distribute_3d(egm, local_rank, world_size, config)
 
         # run EP sharding across ranks
         egm = ep_shard(egm, local_rank, world_size)
-        visualize_graph(egm, filename="deepseek_ep_shard.svg")
+        visualize_graph(egm, filename="llama_4_ep_shard.svg")
 
         # run BMM sharding across ranks
         egm = dp_bmm_shard(egm, local_rank, world_size)
