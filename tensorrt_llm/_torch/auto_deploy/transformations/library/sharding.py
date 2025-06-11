@@ -33,6 +33,7 @@ from ...utils.node_utils import (
     identify_regions_between_residuals,
     is_aggregation_op,
     is_linear_op,
+    is_contraction_op,
     is_op,
     num_users_of_weight_node,
 )
@@ -335,6 +336,86 @@ def column_row_shard(
     return gm
 
 
+def column_row_shard_2(gm: GraphModule, rank: int, world_size: int) -> GraphModule:
+    for n in gm.graph.nodes:                    
+        if is_linear_op(n):
+            # find the input distribution
+            sources = find_all_boundary_nodes(
+                n,
+                lambda x: is_linear_op(x),
+                attr_next="args",
+            )
+            input_column_sharded_X = False
+            if sources:
+                # check if tensor X is already column-sharded (across embedding dimension)    
+                all_input_column_sharded_X = set([s.meta["distributed"]["column_sharded_X"] for s in sources])
+                if len(all_input_column_sharded_X) != 1:
+                    raise ValueError("Multiple sources found for contraction node")
+                input_column_sharded_X = all_input_column_sharded_X.pop()
+            
+            
+            # find the required output distribution
+            sinks = find_all_boundary_nodes(
+                n,
+                lambda x: is_aggregation_op(x),
+                attr_next="users",
+            )
+            dim = None
+            output_column_sharded_X = not input_column_sharded_X
+            if sinks:
+                # check if all sinks are aggregation operations
+                all_sink_aggregation_ops = set([is_aggregation_op(s) for s in sinks])
+                if len(all_sink_aggregation_ops) != 1:
+                    output_column_sharded_X = False
+                op, dim = all_sink_aggregation_ops.pop()
+                
+            # dims are [batch, sequence, embedding]
+            if dim is not None and dim == 2:
+                # dim == 2 means that the sink aggregation operation
+                # performs aggregation across the embedding dimension,
+                # therefore, X cannot be shared (otherwise, that would 
+                # imply distributed aggegation)
+                output_column_sharded_X = False
+            
+            _insert_sharded_matmul(gm, 
+                                   n, 
+                                   dim = 1 if input_column_sharded_X else 0, 
+                                   rank = rank, 
+                                   world_size = world_size, 
+                                   add_dist = not output_column_sharded_X)
+            if "distributed" not in n.meta:
+                n.meta["distributed"] = {}
+            n.meta["distributed"]["column_sharded_X"] = output_column_sharded_X
+    return gm
+
+
+def find_all_boundary_nodes(
+    node: Node,
+    target: Callable,
+    attr_next: str = "users",
+) -> Node:
+    queue = [node]
+    visited = set()
+    boundary_nodes = []
+    
+    visited.add(node)
+    queue = list(n for n in getattr(node, attr_next) if n is not None 
+                    and isinstance(n, Node))
+    while queue:
+        cur_node = queue.pop(0)
+        if target(cur_node):
+            # don't continue pass the boundary condition
+            boundary_nodes.append(cur_node)
+        else:
+            for next_node in getattr(cur_node, attr_next):
+                if next_node is None or not isinstance(next_node, Node):
+                    continue
+                if next_node not in visited:
+                    visited.add(next_node)
+                    queue.append(next_node)
+    return boundary_nodes
+
+
 def distribute_3d(gm: GraphModule, rank: int, world_size: int, config) -> GraphModule:
     ad_logger.debug("Before sharding graph: " + str(gm))
 
@@ -353,8 +434,12 @@ def distribute_3d(gm: GraphModule, rank: int, world_size: int, config) -> GraphM
         num_kv_heads = config.num_key_value_heads
     else:
         num_kv_heads = num_heads
+    inter_dim = embd
+    mlp_dim = embd
     if "intermediate_size" in config:
-        mlp_dim = config.intermediate_size
+        inter_dim = config.intermediate_size
+    if "intermediate_size_mlp" in config:
+        mlp_dim = config.intermediate_size_mlp
     vocab_size = config.vocab_size
     kv_dim = embd * num_kv_heads // num_heads
     if "q_lora_rank" in config:
@@ -375,6 +460,7 @@ def distribute_3d(gm: GraphModule, rank: int, world_size: int, config) -> GraphM
         "d": head_dim,
         "v": vocab_size,
         "m": mlp_dim,
+        "i": inter_dim,
         "n": num_kv_heads,
         "k": kv_dim,
         "P": world_size,
@@ -453,38 +539,57 @@ def distribute_3d(gm: GraphModule, rank: int, world_size: int, config) -> GraphM
                 tensor_meta = child_node.meta["tensor_meta"]
             else:
                 raise ValueError(f"Node {n} has no args or users")
+            
+                # figure out the tensor shape as an einsum string
+        if tensor_meta is not None:
+            einsum_str = shape_to_einsum(tensor_meta.shape)
+        else:
+            einsum_str = "u"  # u for unknown
 
-        if is_linear_op(n, include_quantization=True):
+        dist_tensor = DistributedTensor(modes_extents, einsum_str)
+        n.meta["dist_tensor"] = dist_tensor
+
+        if is_contraction_op(n):
             # find the input distribution
-            prev = bfs(
+            sources = find_all_boundary_nodes(
                 n,
                 # lambda x: is_aggregation_op(x),
-                lambda x: is_linear_op(x),
+                lambda x: is_contraction_op(x),
                 attr_next="args",
-                skip_root=True,
-                allow_empty=True,
             )
-            if prev is not None:
-                input_p_grid = prev.meta["p_grid"]
+            if sources:
+                if len(sources) > 1:
+                    a = 1
+                input_p_grid = sources.meta["p_grid"]
                 prev_rank_order = input_p_grid.rank_order
             else:
                 prev_rank_order = (2, 1, 0)
             
             # find the required output distribution
-            successor = bfs(
+            sinks = find_all_boundary_nodes(
                 n,
                 lambda x: is_aggregation_op(x),
                 attr_next="users",
-                skip_root=True,
-                allow_empty=True,
             )
             dim = None
-            if successor is not None:
-                op, dim = is_aggregation_op(successor)
+            if sinks:
+                if len(sinks) > 1:
+                    a = 1
+                op, dim = is_aggregation_op(sinks[0])
             if dim is not None:
                 pass
 
-            # Find the contraction einsum string
+            # Infer the contraction einsum string
+            A = n.args[0].meta["dist_tensor"]
+            B = n.args[1].meta["dist_tensor"]
+            C = n.meta["dist_tensor"]
+            
+            contraction_einsum_str = f"{A.einsum_str},{B.einsum_str}->{C.einsum_str}"
+            a = 1
+            # assert A.N == B.N, "Input tensors must have the same embedding dimension"
+            # assert A.K == B.K, "Input tensors must have the same embedding dimension"
+            # assert A.M == C.M, "Output tensor must have the same embedding dimension"
+            # assert A.K == C.K, "Output tensor must have the same embedding dimension"
             # We assume that the linear node performs contraction:
             # Y = X @ W^T
             # defined by the einsum string:
@@ -509,14 +614,7 @@ def distribute_3d(gm: GraphModule, rank: int, world_size: int, config) -> GraphM
             )
 
             
-        # figure out the tensor shape as an einsum string
-        if tensor_meta is not None:
-            einsum_str = shape_to_einsum(tensor_meta.shape)
-        else:
-            einsum_str = "u"  # u for unknown
 
-        dist_tensor = DistributedTensor(modes_extents, einsum_str)
-        n.meta["dist_tensor"] = dist_tensor
 
 
     linear_layers = [n for n in gm.graph.nodes if is_linear_op(n)]

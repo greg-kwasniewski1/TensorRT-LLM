@@ -16,6 +16,7 @@ from ._graph import canonicalize_graph, lift_to_meta, move_to_device
 from .export import torch_export_to_gm
 from .library import (
     column_row_shard,
+    column_row_shard_2,
     distribute_3d,
     dp_bmm_shard,
     eliminate_redundant_transposes,
@@ -178,18 +179,20 @@ class InferenceOptimizer:
         # see https://github.com/NVIDIA/TensorRT-LLM/pull/3668#discussion_r2052714528
         egm = optimize_rope(egm)
 
-        visualize_graph(egm, filename="llama_4_before_sharding.svg")
+        # visualize_graph(egm, filename="llama_4_before_sharding.svg")
 
-        # run TP sharding across ranks
-        egm = column_row_shard(egm, local_rank, world_size)
+
         # egm = distribute_3d(egm, local_rank, world_size, config)
 
         # run EP sharding across ranks
         egm = ep_shard(egm, local_rank, world_size)
-        visualize_graph(egm, filename="llama_4_ep_shard.svg")
+        # visualize_graph(egm, filename="llama_4_ep_shard.svg")
 
         # run BMM sharding across ranks
         egm = dp_bmm_shard(egm, local_rank, world_size)
+        
+        # run TP sharding across ranks
+        egm = column_row_shard_2(egm, local_rank, world_size)
 
         # let's run a shape propagation pass to update the graph with correct meta values for
         # subsequent optimization passes. Lift state_dict to meta as shape propagation involves device check

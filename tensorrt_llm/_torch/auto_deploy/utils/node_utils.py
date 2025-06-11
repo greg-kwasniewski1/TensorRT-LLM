@@ -235,7 +235,7 @@ def is_nonlinear_reduction_op(node: Node, include_quantization: bool = False) ->
 
     Using this function is preferred over `is_op` for linear ops to ensure all variants are covered.
     """
-    lin_ops = {
+    nonlin_ops = {
         torch.ops.aten.mean,
         torch.ops.aten.sum,
         torch.ops.aten.max,
@@ -250,8 +250,8 @@ def is_nonlinear_reduction_op(node: Node, include_quantization: bool = False) ->
     }
 
     if include_quantization:
-        lin_ops.update(QUANT_OPS)
-    return is_op(node, lin_ops)
+        nonlin_ops.update(QUANT_OPS)
+    return is_op(node, nonlin_ops)
 
 
 def is_dist_op(node: Node) -> bool:
@@ -346,7 +346,8 @@ def bfs(
     visited = set()
     if skip_root:
         visited.add(node)
-        queue = list(n for n in getattr(node, attr_next) if n is not None)
+        queue = list(n for n in getattr(node, attr_next) if n is not None 
+                     and isinstance(n, Node))
     while queue:
         cur_node = queue.pop(0)
         if boundary is not None and cur_node == boundary:
@@ -624,6 +625,29 @@ def classify_operation_type(node: Node) -> Tuple[str, Optional[int]]:
         return ("unknown", None)
 
 
+def is_contraction_op(node: Node) -> bool:
+    """
+    Check if a node is a contraction operation.
+    """
+    
+    contraction_ops = {
+        torch.ops.aten.linear,
+        torch.ops.linear.simple,
+        torch.ops.aten.matmul,
+        torch.ops.aten.mm,
+        torch.ops.aten.bmm,
+        torch.ops.aten.addmm,
+        torch.ops.aten.baddbmm,
+        torch.ops.aten.addmv,
+        torch.ops.aten.mv,
+        torch.ops.aten.dot,
+        torch.ops.aten.conv1d,
+        torch.ops.aten.conv2d,
+        torch.ops.aten.conv3d,
+    }
+    return is_op(node, contraction_ops)
+
+
 def is_aggregation_op(node: Node) -> bool:
     """
     Classify a PyTorch FX node into operation categories for sharding purposes.
@@ -679,6 +703,7 @@ def is_aggregation_op(node: Node) -> bool:
         torch.ops.aten.prod,
         torch.ops.aten.any,
         torch.ops.aten.all,
+        torch.ops.aten.topk,
         # Normalization operations - aggregate over specific dimensions
         torch.ops.aten.layer_norm,
         torch.ops.aten.group_norm,
@@ -729,7 +754,8 @@ def _extract_aggregation_dimension(node: Node) -> Optional[int]:
         # For softmax: softmax(input, dim, dtype=None)
         if len(node.args) >= 2:
             return node.args[1]
-
+        else:
+            raise ValueError(f"Softmax operation {node.target} has no dimension parameter")
     elif is_op(
         node,
         {
@@ -756,6 +782,10 @@ def _extract_aggregation_dimension(node: Node) -> Optional[int]:
             elif isinstance(normalized_shape, int):
                 # Aggregates over the last dimension
                 return -1
+    elif is_op(node, torch.ops.aten.topk):
+        # topk shouldn't be sharded
+        return 2
+    
 
     # Check kwargs
     for param_name in dim_param_names:

@@ -5,7 +5,7 @@ import re
 def recolor(
         nodes: dict,
         dir: str = '/mnt/c/greg_stuff/code/TensorRT-LLM/examples/auto_deploy',
-        svg_filename: str = "deepseek_ep_shard.svg"):
+        svg_filename: str = "llama_4_before_sharding.svg"):
     """
     Set node colors in svg file
     Inputs:
@@ -47,11 +47,12 @@ if __name__ == "__main__":
     end_color = "#0000ff"
     unaccounted_color = "#ff0000"
     nodes = {
-        start_color: [],
-        end_color: [
-            "mean_1", "mean_2", "mean_3", "mean_4", "mean_5", "mean_6",
-            "mean_7", "mean_8"
-        ],
-        unaccounted_color: []
+        start_color: ["simple_3", "simple_6", "simple_10",
+                      "simple_11", "simple_14"], # ["bmm", "bmm_1"],
+        end_color: ["simple_15"],
+        #     "mean_1", "mean_2", "mean_3", "mean_4", "mean_5", "mean_6",
+        #     "mean_7", "mean_8"
+        # ],
+        unaccounted_color: ["bsnd_grouped_sdpa_2"]
     }
     recolor(nodes)
