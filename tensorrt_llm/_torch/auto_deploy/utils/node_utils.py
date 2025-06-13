@@ -387,6 +387,39 @@ def bfs_(
     raise RuntimeError(f"Could not find node with target condition {target}.")
 
 
+def predecessors(node: Node, 
+                 boundary_condition: Callable = None) -> List[Node]:
+    """
+    Get the predecessors of a node.
+    """
+    predecessor_list = []
+    for next_node in node.args:
+        if next_node is None or not isinstance(next_node, Node):
+            continue
+        if boundary_condition is not None and boundary_condition(next_node):
+            continue
+        if next_node not in predecessor_list:
+            predecessor_list.append(next_node)
+            predecessor_list.extend(predecessors(next_node, boundary_condition))
+    return predecessor_list
+
+def successors(node: Node, 
+               boundary_condition: Callable = None) -> List[Node]:
+    """
+    Get the successors of a node.
+    """
+    successor_list = []
+    for next_node in node.users:
+        if next_node is None or not isinstance(next_node, Node):
+            continue
+        if boundary_condition is not None and boundary_condition(next_node):
+            continue
+        if next_node not in successor_list:
+            successor_list.append(next_node)
+            successor_list.extend(successors(next_node, boundary_condition))
+    return successor_list
+
+
 def extract_output_tuple(node: Node, count: int = 2):
     """
     Extract up to `count` outputs from a tuple-producing node.
@@ -479,6 +512,37 @@ def classify_operation_type(node: Node) -> Tuple[str, Optional[int]]:
     if not isinstance(node, Node) or node.op != "call_function":
         return ("unknown", None)
 
+
+    # Check operation type
+    if node.target in pointwise_ops:
+        return ("pointwise", None)
+
+    elif node.target in contraction_ops:
+        return ("linear", None)
+
+    elif node.target in nonlinear_reduction_ops:
+        # Extract the aggregation dimension
+        agg_dim = _extract_aggregation_dimension(node)
+        return ("nonlinear_reduction", agg_dim)
+
+    elif node.target in attention_ops:
+        # Attention operations aggregate over sequence dimension
+        # For standard attention layouts: [batch, num_heads, seq_len, head_dim]
+        # The aggregation happens over seq_len (dimension -2 or 2)
+        return ("nonlinear_reduction", -2)  # sequence dimension
+
+    else:
+        return ("unknown", None)
+
+
+pointwise_ops = {}
+contraction_ops = {}
+nonlinear_reduction_ops = {}
+attention_ops = {}
+
+def init_op_list():
+    global pointwise_ops, contraction_ops, nonlinear_reduction_ops, attention_ops
+
     # Category A: Pointwise Operations
     pointwise_ops = {
         # Element-wise arithmetic
@@ -496,7 +560,6 @@ def classify_operation_type(node: Node) -> Tuple[str, Optional[int]]:
         torch.ops.aten.relu,
         torch.ops.aten.relu_,
         torch.ops.aten.gelu,
-        torch.ops.aten.gelu_approximate,
         torch.ops.aten.silu,
         torch.ops.aten.silu_,
         torch.ops.aten.tanh,
@@ -546,106 +609,78 @@ def classify_operation_type(node: Node) -> Tuple[str, Optional[int]]:
         torch.ops.aten.hardswish,
     }
 
-    # Category B: Linear Operations (Matrix/Tensor Contractions)
-    linear_ops = {
-        torch.ops.aten.linear,
-        torch.ops.linear.simple,
-        torch.ops.aten.matmul,
-        torch.ops.aten.mm,
-        torch.ops.aten.bmm,
-        torch.ops.aten.addmm,
-        torch.ops.aten.baddbmm,
-        torch.ops.aten.addmv,
-        torch.ops.aten.mv,
-        torch.ops.aten.dot,
-        torch.ops.aten.conv1d,
-        torch.ops.aten.conv2d,
-        torch.ops.aten.conv3d,
-        torch.ops.aten.conv_transpose1d,
-        torch.ops.aten.conv_transpose2d,
-        torch.ops.aten.embedding,
-        torch.ops.aten.embedding_bag,
-    }
 
-    # Category C: Nonlinear Reduction Operations
-    # We need to analyze both the operation and its dimension parameter
+    contraction_ops = {
+            torch.ops.aten.linear,
+            torch.ops.linear,
+            torch.ops.linear.simple,
+            torch.ops.aten.matmul,
+            torch.ops.aten.mm,
+            torch.ops.aten.bmm,
+            torch.ops.aten.addmm,
+            torch.ops.aten.baddbmm,
+            torch.ops.aten.addmv,
+            torch.ops.aten.mv,
+            torch.ops.aten.dot,
+            torch.ops.aten.conv1d,
+            torch.ops.aten.conv2d,
+            torch.ops.aten.conv3d,
+        }
+
     nonlinear_reduction_ops = {
-        # Reduction operations - need to check 'dim' parameter
-        torch.ops.aten.mean,
-        torch.ops.aten.sum,
-        torch.ops.aten.max,
-        torch.ops.aten.min,
-        torch.ops.aten.amax,
-        torch.ops.aten.amin,
-        torch.ops.aten.std,
-        torch.ops.aten.var,
-        torch.ops.aten.norm,
-        torch.ops.aten.linalg_norm,
-        torch.ops.aten.prod,
-        torch.ops.aten.any,
-        torch.ops.aten.all,
-        # Normalization operations - aggregate over specific dimensions
-        torch.ops.aten.layer_norm,
-        torch.ops.aten.group_norm,
-        torch.ops.aten.batch_norm,
-        torch.ops.aten.instance_norm,
-        torch.ops.aten.rms_norm,  # if available
-        # Softmax and related - aggregate over specific dimensions
-        torch.ops.aten.softmax,
-        torch.ops.aten.log_softmax,
-        torch.ops.aten.gumbel_softmax,
-    }
+            # Reduction operations - need to check 'dim' parameter
+            torch.ops.aten.mean,
+            torch.ops.aten.sum,
+            torch.ops.aten.max,
+            torch.ops.aten.min,
+            torch.ops.aten.amax,
+            torch.ops.aten.amin,
+            torch.ops.aten.std,
+            torch.ops.aten.var,
+            torch.ops.aten.norm,
+            torch.ops.aten.linalg_norm,
+            torch.ops.aten.prod,
+            torch.ops.aten.any,
+            torch.ops.aten.all,
+            torch.ops.aten.topk,
+            # Normalization operations - aggregate over specific dimensions
+            torch.ops.aten.layer_norm,
+            torch.ops.aten.group_norm,
+            torch.ops.aten.batch_norm,
+            torch.ops.aten.instance_norm,
+            torch.ops.aten.rms_norm,  # if available
+            # Softmax and related - aggregate over specific dimensions
+            torch.ops.aten.softmax,
+            torch.ops.aten.log_softmax,
+            torch.nn.functional.gumbel_softmax,
+            # while split is not a reduction operation, it is a non-linear, non-pointwise operation
+            torch.ops.aten.split,
+            torch.ops.aten.split_with_sizes,
+        }
 
-    # Attention operations - special case (aggregate over sequence dimension)
     attention_ops = {
-        torch.ops.attention.scaled_dot_product_attention,
-        torch.ops.attention.grouped_sdpa,
-        torch.ops.attention.bsnd_grouped_sdpa,
-    }
+            torch.ops.attention.scaled_dot_product_attention,
+            torch.ops.attention.grouped_sdpa,
+            torch.ops.attention.bsnd_grouped_sdpa,
+        }
 
-    # Check operation type
-    if node.target in pointwise_ops:
-        return ("pointwise", None)
-
-    elif node.target in linear_ops:
-        return ("linear", None)
-
-    elif node.target in nonlinear_reduction_ops:
-        # Extract the aggregation dimension
-        agg_dim = _extract_aggregation_dimension(node)
-        return ("nonlinear_reduction", agg_dim)
-
-    elif node.target in attention_ops:
-        # Attention operations aggregate over sequence dimension
-        # For standard attention layouts: [batch, num_heads, seq_len, head_dim]
-        # The aggregation happens over seq_len (dimension -2 or 2)
-        return ("nonlinear_reduction", -2)  # sequence dimension
-
-    else:
-        return ("unknown", None)
 
 
 def is_contraction_op(node: Node) -> bool:
     """
     Check if a node is a contraction operation.
     """
-    
-    contraction_ops = {
-        torch.ops.aten.linear,
-        torch.ops.linear.simple,
-        torch.ops.aten.matmul,
-        torch.ops.aten.mm,
-        torch.ops.aten.bmm,
-        torch.ops.aten.addmm,
-        torch.ops.aten.baddbmm,
-        torch.ops.aten.addmv,
-        torch.ops.aten.mv,
-        torch.ops.aten.dot,
-        torch.ops.aten.conv1d,
-        torch.ops.aten.conv2d,
-        torch.ops.aten.conv3d,
-    }
+    if len(contraction_ops) == 0:
+        init_op_list()
     return is_op(node, contraction_ops)
+
+def is_attention_op(node: Node) -> bool:
+    """
+    Check if a node is an attention operation.
+    """
+    if len(attention_ops) == 0:
+        init_op_list()
+    return is_op(node, attention_ops)
 
 
 def is_aggregation_op(node: Node) -> bool:
@@ -661,76 +696,23 @@ def is_aggregation_op(node: Node) -> bool:
         - operation_type: 'pointwise', 'linear', or 'nonlinear_reduction'
         - aggregation_dimension: For nonlinear operations, the dimension that's being aggregated over
     """
+    if len(contraction_ops) == 0:
+        init_op_list()
 
     if not isinstance(node, Node) or node.op != "call_function":
         return False
 
-    # Category B: Linear Operations (Matrix/Tensor Contractions)
-    linear_ops = {
-        torch.ops.aten.linear,
-        torch.ops.linear.simple,
-        torch.ops.aten.matmul,
-        torch.ops.aten.mm,
-        torch.ops.aten.bmm,
-        torch.ops.aten.addmm,
-        torch.ops.aten.baddbmm,
-        torch.ops.aten.addmv,
-        torch.ops.aten.mv,
-        torch.ops.aten.dot,
-        torch.ops.aten.conv1d,
-        torch.ops.aten.conv2d,
-        torch.ops.aten.conv3d,
-        torch.ops.aten.conv_transpose1d,
-        torch.ops.aten.conv_transpose2d,
-        torch.ops.aten.embedding,
-        torch.ops.aten.embedding_bag,
-    }
 
-    # Category C: Nonlinear Reduction Operations
-    # We need to analyze both the operation and its dimension parameter
-    nonlinear_reduction_ops = {
-        # Reduction operations - need to check 'dim' parameter
-        torch.ops.aten.mean,
-        torch.ops.aten.sum,
-        torch.ops.aten.max,
-        torch.ops.aten.min,
-        torch.ops.aten.amax,
-        torch.ops.aten.amin,
-        torch.ops.aten.std,
-        torch.ops.aten.var,
-        torch.ops.aten.norm,
-        torch.ops.aten.linalg_norm,
-        torch.ops.aten.prod,
-        torch.ops.aten.any,
-        torch.ops.aten.all,
-        torch.ops.aten.topk,
-        # Normalization operations - aggregate over specific dimensions
-        torch.ops.aten.layer_norm,
-        torch.ops.aten.group_norm,
-        torch.ops.aten.batch_norm,
-        torch.ops.aten.instance_norm,
-        torch.ops.aten.rms_norm,  # if available
-        # Softmax and related - aggregate over specific dimensions
-        torch.ops.aten.softmax,
-        torch.ops.aten.log_softmax,
-        torch.nn.functional.gumbel_softmax,
-    }
-
-    # Attention operations - special case (aggregate over sequence dimension)
-    attention_ops = {
-        torch.ops.attention.scaled_dot_product_attention,
-        torch.ops.attention.grouped_sdpa,
-        torch.ops.attention.bsnd_grouped_sdpa,
-    }
-
-    if is_op(node, linear_ops):
-        return ("linear", None)
+    if is_op(node, contraction_ops):
+        return ("contraction", None)
 
     elif is_op(node, nonlinear_reduction_ops):
         # Extract the aggregation dimension
         agg_dim = _extract_aggregation_dimension(node)
         if isinstance(agg_dim, Iterable):
             agg_dim = agg_dim[0]
+        if agg_dim == -1:
+            agg_dim = 2
         return ("nonlinear_reduction", agg_dim)
 
     elif is_op(node, attention_ops):
@@ -781,11 +763,14 @@ def _extract_aggregation_dimension(node: Node) -> Optional[int]:
                 return list(range(-len(normalized_shape), 0))
             elif isinstance(normalized_shape, int):
                 # Aggregates over the last dimension
-                return -1
+                return 2
     elif is_op(node, torch.ops.aten.topk):
         # topk shouldn't be sharded
         return 2
     
+    elif is_op(node, torch.ops.aten.split) or is_op(node, torch.ops.aten.split_with_sizes):
+        # split dimension argument is the last one
+        return node.args[-1]
 
     # Check kwargs
     for param_name in dim_param_names:
@@ -794,10 +779,10 @@ def _extract_aggregation_dimension(node: Node) -> Optional[int]:
 
     # Default heuristics based on operation type
     if node.target in {torch.ops.aten.softmax, torch.ops.aten.log_softmax}:
-        return -1  # Usually applied to last dimension
+        return 2  # Usually applied to last dimension
 
     elif node.target == torch.ops.aten.layer_norm:
-        return -1  # Usually normalizes embedding dimension
+        return 2  # Usually normalizes embedding dimension
 
     elif node.target == torch.ops.aten.batch_norm:
         return 1  # Usually normalizes channel dimension

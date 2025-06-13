@@ -29,11 +29,14 @@ from ...distributed.distributed_classes import DistributedTensor, PGrid
 from ...utils.logger import ad_logger
 from ...utils.node_utils import (
     bfs,
+    successors,
+    predecessors,
     extract_param_names_from_lin_node,
     identify_regions_between_residuals,
     is_aggregation_op,
     is_linear_op,
     is_contraction_op,
+    is_attention_op,
     is_op,
     num_users_of_weight_node,
 )
@@ -336,56 +339,171 @@ def column_row_shard(
     return gm
 
 
-def column_row_shard_2(gm: GraphModule, rank: int, world_size: int) -> GraphModule:
-    for n in gm.graph.nodes:                    
-        if is_linear_op(n):
-            # find the input distribution
-            sources = find_all_boundary_nodes(
+def get_node_dict(gm: GraphModule) -> Dict[str, Node]:
+    node_dict = {}
+    for n in gm.graph.nodes:
+        node_dict[n.name] = n
+    return node_dict
+
+def get_nth_predecessor(n: Node, nth: int) -> Node:
+    for i, p in enumerate(n.args):
+        if p is not None and isinstance(p, Node):
+            if i == nth:
+                return p
+            else:
+                return get_nth_predecessor(p, nth - 1)
+            
+def get_nth_successor(n: Node, nth: int) -> Node:
+    for i, p in enumerate(n.users):
+        if p is not None and isinstance(p, Node):
+            if i == nth:
+                return p
+            else:
+                return get_nth_successor(p, nth - 1)
+
+def column_row_shard_2(gm: GraphModule, rank: int, world_size: int, config) -> GraphModule:
+    g = get_node_dict(gm)
+    for n in gm.graph.nodes:
+        if "distributed" not in n.meta:
+            n.meta["distributed"] = {}
+        
+        # find the input distribution
+        input_is_column_sharded = False
+        n.meta["distributed"]["is_column_sharded"] = False
+        
+        all_inputs_are_column_sharded = set([s.meta["distributed"]["is_column_sharded"] 
+                            for s in n.args 
+                            if s is not None and 
+                            isinstance(s,Node) and 
+                            'weight' not in s.name and
+                            "distributed" in s.meta])
+        if len(all_inputs_are_column_sharded) > 1:
+            # We have conflicting input distributions: some inputs are sharded, some are not.
+            # We have three options:
+            # 1. We check if indeed this operation could potentially be sharded. If not,
+            #    we made mistake in the previous sharding step and raise an error.
+            # 2. We can shard the input that is not sharded
+            # 3. We all-gather the input that is not sharded
+            
+            # 1. Check if this is legal
+            if is_aggregation_op(n) and is_aggregation_op(n)[1] == 2:
+                raise ValueError(f"Operation {n} has some of its inputs sharded, which is not allowed.")
+            
+            sinks = find_all_boundary_nodes(
                 n,
-                lambda x: is_linear_op(x),
-                attr_next="args",
+                lambda x: is_aggregation_op(x),
+                attr_next="users",
             )
-            input_column_sharded_X = False
-            if sources:
-                # check if tensor X is already column-sharded (across embedding dimension)    
-                all_input_column_sharded_X = set([s.meta["distributed"]["column_sharded_X"] for s in sources])
-                if len(all_input_column_sharded_X) != 1:
-                    raise ValueError("Multiple sources found for contraction node")
-                input_column_sharded_X = all_input_column_sharded_X.pop()
+            if sinks:
+                all_sink_aggregation_dims = set([is_aggregation_op(s)[1] for s in sinks])
+                # dims are [batch, sequence, embedding]
+                if 2 in all_sink_aggregation_dims:
+                    # dim == 2 means that the sink aggregation operation
+                    # performs aggregation across the embedding dimension,
+                    # therefore, X cannot be shared (otherwise, that would 
+                    # imply distributed aggegation)
+                    raise ValueError(f"Operation {n} has some of its inputs sharded, which is not allowed.")
+                
+            # # 2. Shard the input that is not sharded
+            # for s in n.args:
+            #     if s is not None and isinstance(s,Node) and "distributed" in s.meta:
+            #         if not s.meta["distributed"]["is_column_sharded"]:
+            #             with gm.graph.inserting_before(s):
+            #                 tensor_slice = gm.graph.call_function(
+            #                     torch.ops.aten.slice.Tensor, args=(tensor_node, 0, start_idx, end_idx, 1)
+            #                 )
+            #             # Update BMM node to use the sliced tensor
+            #             bmm_node.update_arg(arg_idx, tensor_slice)
+            # 3. All-gather the input that is not sharded
             
-            
+        if all_inputs_are_column_sharded:
+            input_is_column_sharded = all_inputs_are_column_sharded.pop()
+        n.meta["distributed"]["is_column_sharded"] = input_is_column_sharded
+        
+        # only linear ops can change distribution. All other ops preserve the distribution    
+        if is_linear_op(n):            
             # find the required output distribution
             sinks = find_all_boundary_nodes(
                 n,
                 lambda x: is_aggregation_op(x),
                 attr_next="users",
             )
-            dim = None
-            output_column_sharded_X = not input_column_sharded_X
+            can_output_be_column_sharded = True
             if sinks:
                 # check if all sinks are aggregation operations
-                all_sink_aggregation_ops = set([is_aggregation_op(s) for s in sinks])
-                if len(all_sink_aggregation_ops) != 1:
-                    output_column_sharded_X = False
-                op, dim = all_sink_aggregation_ops.pop()
-                
-            # dims are [batch, sequence, embedding]
-            if dim is not None and dim == 2:
-                # dim == 2 means that the sink aggregation operation
-                # performs aggregation across the embedding dimension,
-                # therefore, X cannot be shared (otherwise, that would 
-                # imply distributed aggegation)
-                output_column_sharded_X = False
+                all_sink_aggregation_dims = set([is_aggregation_op(s)[1] for s in sinks])
+                # dims are [batch, sequence, embedding]
+                if 2 in all_sink_aggregation_dims:
+                    # dim == 2 means that the sink aggregation operation
+                    # performs aggregation across the embedding dimension,
+                    # therefore, X cannot be shared (otherwise, that would 
+                    # imply distributed aggegation)
+                    can_output_be_column_sharded = False
             
+            
+            output_is_column_sharded = can_output_be_column_sharded and not input_is_column_sharded
             _insert_sharded_matmul(gm, 
                                    n, 
-                                   dim = 1 if input_column_sharded_X else 0, 
+                                   dim = 1 if input_is_column_sharded else 0, 
                                    rank = rank, 
                                    world_size = world_size, 
-                                   add_dist = not output_column_sharded_X)
+                                   add_dist = not output_is_column_sharded)
             if "distributed" not in n.meta:
                 n.meta["distributed"] = {}
-            n.meta["distributed"]["column_sharded_X"] = output_column_sharded_X
+            n.meta["distributed"]["is_column_sharded"] = output_is_column_sharded
+            
+        # but attention nodes, if their inputs are NOT sharded, 
+        # can do a column-split to allow distributed attention computation
+        if is_attention_op(n) and not input_is_column_sharded:
+            # find the required output distribution
+            sinks = find_all_boundary_nodes(
+                n,
+                lambda x: is_aggregation_op(x),
+                attr_next="users",
+            )
+            can_output_be_column_sharded = True
+            if sinks:
+                # check if all sinks are aggregation operations
+                all_sink_aggregation_dims = set([is_aggregation_op(s)[1] for s in sinks])
+                # dims are [batch, sequence, embedding]
+                if 2 in all_sink_aggregation_dims:
+                    # dim == 2 means that the sink aggregation operation
+                    # performs aggregation across the embedding dimension,
+                    # therefore, X cannot be shared (otherwise, that would 
+                    # imply distributed aggegation)
+                    can_output_be_column_sharded = False
+            
+            if can_output_be_column_sharded:
+                inputs = [s for s in n.args if s is not None and isinstance(s, Node)]
+                assert len(inputs) >= 3, "Attention node should have at least 3 inputs"
+                q_node, k_node, v_node = inputs[:3]
+                # get the num_heads and head_dims (potentially, latent_dim > head_dim for q and k)
+                if is_op(n, torch.ops.attention.bsnd_grouped_sdpa):
+                    head_dim_no = 2
+                else:
+                    head_dim_no = 3                
+                num_heads = set([s.meta["val"].shape[head_dim_no] for s in [q_node, k_node, v_node]])
+                assert len(num_heads) == 1, "All inputs to attention node should have the same number of heads"
+                num_heads = num_heads.pop()
+                qk_head_dim =  set([s.meta["val"].shape[-1] for s in [q_node, k_node]])
+                assert len(qk_head_dim) == 1, "All inputs to attention node should have the same head dimension"
+                qk_head_dim = qk_head_dim.pop()
+                v_head_dim = v_node.meta["val"].shape[-1]
+                
+                assert (num_heads > world_size) and num_heads % world_size == 0, "Number of heads must be divisible by world size"
+                heads_per_rank = num_heads // world_size
+                for i, src in enumerate([q_node, k_node, v_node]):
+                    # column-split the input
+                    distribute_tensor(gm, 
+                                      consumer_node = n, 
+                                      tensor_node = src, 
+                                      split_dim = head_dim_no, 
+                                      arg_idx = i, 
+                                      start_idx = heads_per_rank * rank, 
+                                      end_idx = heads_per_rank * (rank + 1))
+                n.meta["distributed"]["is_column_sharded"] = True
+                
+                
     return gm
 
 
@@ -904,3 +1022,77 @@ def dp_bmm_shard(gm: GraphModule, rank: int, world_size: int) -> GraphModule:
     ad_logger.debug("After sharding BMM: " + str(gm))
     ad_logger.info(f"Found {num_bmm_shards} BMM shards")
     return gm
+
+
+
+
+
+def distribute_tensor(gm: GraphModule,
+        consumer_node: Node, 
+        tensor_node: Node, 
+        split_dim: int,
+        arg_idx: int, 
+        start_idx: int, end_idx: int
+    ):
+        """Unified helper function to shard either a parameter tensor or a dynamic tensor.
+
+        Args:
+            consumer_node: The node that is being processed
+            tensor_node: The input tensor node to shard
+            arg_idx: The argument index of the tensor in the consumer_node node
+            start_idx: Start index for sharding
+            end_idx: End index for sharding
+        """
+
+        # Define slice function for the sharding
+        def slice_tensor(t: torch.Tensor) -> torch.Tensor:
+            """
+            Args:
+                t: torch.Tensor: tensor to slice
+                split_dim: int: dimension across which the slice is performed
+                start_idx: int: start index of the slice
+                end_idx: int: end index of the slice
+            Returns:
+                torch.Tensor: sliced tensor
+                
+            Example:
+                t = torch.rand(8,16,32,64)
+                slice_tensor(t, 1, 0, 4) # returns a tensor of shape (8,4,32,64)
+                slice_tensor(t, 2, 4, 8) # returns a tensor of shape (8,16,4,64)
+                slice_tensor(t, 3, 16, 32) # returns a tensor of shape (8,16,32,16)
+            """
+            # Create a list of slice objects for all dimensions
+            slices = [slice(None)] * t.dim()
+            # Set the specific dimension to slice from start_idx to end_idx
+            slices[split_dim] = slice(start_idx, end_idx)
+            # Apply the slicing and return the result
+            return t[tuple(slices)]
+
+
+        if tensor_node.op == "get_attr":
+            # Handle parameter tensor
+            weight_key = tensor_node.target
+            modname, _, param_name = weight_key.rpartition(".")
+            param = gm.get_parameter(weight_key)
+
+            # Update the parameter with its shard
+            param_new = nn.Parameter(slice_tensor(param).detach().clone(), requires_grad=True)
+            gm.get_submodule(modname).register_parameter(param_name, param_new)
+
+            # Register load state dict hook
+            gm._register_load_state_dict_pre_hook(
+                partial(
+                    _load_hook,
+                    f_split=slice_tensor,
+                    param_key=weight_key,
+                    param_shape=param_new.shape,
+                )
+            )
+        else:
+            # Handle dynamic tensor
+            with gm.graph.inserting_before(consumer_node):
+                tensor_slice = gm.graph.call_function(
+                    torch.ops.aten.slice.Tensor, args=(tensor_node, split_dim, start_idx, end_idx, 1)
+                )
+            # Update BMM node to use the sliced tensor
+            consumer_node.update_arg(arg_idx, tensor_slice)

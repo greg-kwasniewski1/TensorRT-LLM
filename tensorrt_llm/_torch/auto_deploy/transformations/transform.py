@@ -179,9 +179,7 @@ class InferenceOptimizer:
         # see https://github.com/NVIDIA/TensorRT-LLM/pull/3668#discussion_r2052714528
         egm = optimize_rope(egm)
 
-        # visualize_graph(egm, filename="llama_4_before_sharding.svg")
-
-
+        # egm = column_row_shard(egm, local_rank, world_size)
         # egm = distribute_3d(egm, local_rank, world_size, config)
 
         # run EP sharding across ranks
@@ -192,7 +190,8 @@ class InferenceOptimizer:
         egm = dp_bmm_shard(egm, local_rank, world_size)
         
         # run TP sharding across ranks
-        egm = column_row_shard_2(egm, local_rank, world_size)
+        # visualize_graph(egm, filename="deepseek_before_sharding.svg")
+        egm = column_row_shard_2(egm, local_rank, world_size, config)
 
         # let's run a shape propagation pass to update the graph with correct meta values for
         # subsequent optimization passes. Lift state_dict to meta as shape propagation involves device check
