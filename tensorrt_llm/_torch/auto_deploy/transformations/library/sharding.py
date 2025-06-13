@@ -367,15 +367,24 @@ def column_row_shard_2(gm: GraphModule, rank: int, world_size: int, config) -> G
         if "distributed" not in n.meta:
             n.meta["distributed"] = {}
         
+        if "val" in n.meta:
+            # tensors are initially, by default, replicated
+            input_is_column_sharded = False
+        else:
+            # these are states, parameters, constants, but also, "flashinfer" falls here
+            input_is_column_sharded = True
+        
+        n.meta["distributed"]["is_column_sharded"] = input_is_column_sharded
+        
+        
         # find the input distribution
-        input_is_column_sharded = False
-        n.meta["distributed"]["is_column_sharded"] = False
         
         all_inputs_are_column_sharded = set([s.meta["distributed"]["is_column_sharded"] 
                             for s in n.args 
                             if s is not None and 
                             isinstance(s,Node) and 
                             'weight' not in s.name and
+                            # 'val' in s.meta and
                             "distributed" in s.meta])
         if len(all_inputs_are_column_sharded) > 1:
             # We have conflicting input distributions: some inputs are sharded, some are not.
@@ -428,6 +437,7 @@ def column_row_shard_2(gm: GraphModule, rank: int, world_size: int, config) -> G
                 lambda x: is_aggregation_op(x),
                 attr_next="users",
             )
+            weigh = n.args[1]
             can_output_be_column_sharded = True
             if sinks:
                 # check if all sinks are aggregation operations
@@ -451,6 +461,10 @@ def column_row_shard_2(gm: GraphModule, rank: int, world_size: int, config) -> G
             if "distributed" not in n.meta:
                 n.meta["distributed"] = {}
             n.meta["distributed"]["is_column_sharded"] = output_is_column_sharded
+            stat = (n, weigh.name, input_is_column_sharded, can_output_be_column_sharded, output_is_column_sharded)
+            print(f"stat: {stat}")
+            if not can_output_be_column_sharded and not input_is_column_sharded:
+                print(f"\nWarning, simple shard detected! {stat}")
             
         # but attention nodes, if their inputs are NOT sharded, 
         # can do a column-split to allow distributed attention computation

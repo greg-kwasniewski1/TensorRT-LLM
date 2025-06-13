@@ -139,13 +139,11 @@ class InferenceOptimizer:
         ############################################################################################
         # RUN PATTERN MATCHER TRANSFORMATIONS TO STANDARDIZE GRAPH REPRESENTATION
         ############################################################################################
-        visualize_graph(egm, filename="qwen_original.svg")
         # quantization
         egm = quantize(egm, self.factory.get_quant_config())
 
         # Match MoE pattern
         egm = match_moe_pattern(egm)
-        visualize_graph(egm, filename="qwen_moe.svg")
 
         # Match repeat_kv pattern
         egm = match_repeat_kv(egm)
@@ -190,7 +188,7 @@ class InferenceOptimizer:
         egm = dp_bmm_shard(egm, local_rank, world_size)
         
         # run TP sharding across ranks
-        # visualize_graph(egm, filename="deepseek_before_sharding.svg")
+        # visualize_graph(egm, filename=f"{config.model_type}_before_sharding.svg")
         egm = column_row_shard_2(egm, local_rank, world_size, config)
 
         # let's run a shape propagation pass to update the graph with correct meta values for
