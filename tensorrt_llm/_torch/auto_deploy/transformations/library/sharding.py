@@ -20,6 +20,7 @@ import operator
 from collections import defaultdict
 from functools import partial
 from typing import Callable, DefaultDict, Dict, List, Set
+from collections.abc import Iterable
 
 import torch
 import torch.nn as nn
@@ -378,14 +379,30 @@ def column_row_shard_2(gm: GraphModule, rank: int, world_size: int, config) -> G
         
         
         # find the input distribution
+        try:
+            shardable_inputs = [
+                s
+                for s in n.args
+                if s is not None
+                and isinstance(s, Node)
+                and not s.op == "get_attr"
+                and (
+                    ('val' in s.meta
+                        and (isinstance(s.meta['val'], tuple)
+                        or isinstance(s.meta['val'], list)
+                        or len(s.meta['val'].shape) >= 2)
+                    )
+                    or 'val' not in s.meta
+                )
+            ]
+        except:
+            a = 1
         
-        all_inputs_are_column_sharded = set([s.meta["distributed"]["is_column_sharded"] 
-                            for s in n.args 
-                            if s is not None and 
-                            isinstance(s,Node) and 
-                            'weight' not in s.name and
-                            # 'val' in s.meta and
-                            "distributed" in s.meta])
+        all_inputs_are_column_sharded = set([
+            s.meta["distributed"]["is_column_sharded"]
+            for s in shardable_inputs
+        ])
+
         if len(all_inputs_are_column_sharded) > 1:
             # We have conflicting input distributions: some inputs are sharded, some are not.
             # We have three options:
@@ -412,18 +429,40 @@ def column_row_shard_2(gm: GraphModule, rank: int, world_size: int, config) -> G
                     # therefore, X cannot be shared (otherwise, that would 
                     # imply distributed aggegation)
                     raise ValueError(f"Operation {n} has some of its inputs sharded, which is not allowed.")
+            
+            
+            if is_attention_op(n):
+                # This means that most likely Q, K, V were sharded, but the attention mask
+                # was not, since it's static and never had a chance to pass through the sharding
+                # linear layers' logic.
                 
-            # # 2. Shard the input that is not sharded
-            # for s in n.args:
-            #     if s is not None and isinstance(s,Node) and "distributed" in s.meta:
-            #         if not s.meta["distributed"]["is_column_sharded"]:
-            #             with gm.graph.inserting_before(s):
-            #                 tensor_slice = gm.graph.call_function(
-            #                     torch.ops.aten.slice.Tensor, args=(tensor_node, 0, start_idx, end_idx, 1)
-            #                 )
-            #             # Update BMM node to use the sliced tensor
-            #             bmm_node.update_arg(arg_idx, tensor_slice)
-            # 3. All-gather the input that is not sharded
+                assert len(shardable_inputs) == 4, "Expecting Q, K, V, mask inputs for attention"
+                assert all([s.meta["distributed"]["is_column_sharded"] for s in shardable_inputs[:3]]), "Expecting Q, K, V to be sharded"
+                assert not shardable_inputs[3].meta["distributed"]["is_column_sharded"], "Expecting mask to be replicated"
+                
+                # If so, we just tag the mask as sharded and we are good to shard the attention op
+                shardable_inputs[3].meta["distributed"]["is_column_sharded"] = True
+                all_inputs_are_column_sharded = set([True])
+            else:
+                a = 1
+                
+                # # # 2. Shard the input that is not sharded
+                # for s in shardable_inputs:                
+                #     if not s.meta["distributed"]["is_column_sharded"]:
+                #         with gm.graph.inserting_before(s):
+                #             local_size = s.meta["val"].shape[1] // world_size
+                #             start_idx = local_size * rank
+                #             end_idx = start_idx + local_size
+                #             if rank == world_size - 1:
+                #                 end_idx = s.meta["val"].shape[1]
+                #             print(f"slicing {s.name} from {start_idx} to {end_idx}")
+                #             tensor_slice = gm.graph.call_function(
+                #                 torch.ops.aten.slice.Tensor, args=(s, 0, start_idx, end_idx, 1)
+                #             )
+                #             # Update BMM node to use the sliced tensor
+                #             n.update_arg(n.args.index(s), tensor_slice)
+
+            
             
         if all_inputs_are_column_sharded:
             input_is_column_sharded = all_inputs_are_column_sharded.pop()
@@ -548,366 +587,366 @@ def find_all_boundary_nodes(
     return boundary_nodes
 
 
-def distribute_3d(gm: GraphModule, rank: int, world_size: int, config) -> GraphModule:
-    ad_logger.debug("Before sharding graph: " + str(gm))
+# def distribute_3d(gm: GraphModule, rank: int, world_size: int, config) -> GraphModule:
+#     ad_logger.debug("Before sharding graph: " + str(gm))
 
-    if world_size < 2:
-        ad_logger.info("Skipping sharding for single device")
-        return gm
+#     if world_size < 2:
+#         ad_logger.info("Skipping sharding for single device")
+#         return gm
 
-    assert isinstance(gm, GraphModule), "Expecting GraphModule"
+#     assert isinstance(gm, GraphModule), "Expecting GraphModule"
 
-    batch_size = config.batch_size
-    seq_len = config.seq_len
-    embd = config.hidden_size
-    num_heads = config.num_attention_heads
-    head_dim = config.hidden_size // config.num_attention_heads
-    if "num_key_value_heads" in config:
-        num_kv_heads = config.num_key_value_heads
-    else:
-        num_kv_heads = num_heads
-    inter_dim = embd
-    mlp_dim = embd
-    if "intermediate_size" in config:
-        inter_dim = config.intermediate_size
-    if "intermediate_size_mlp" in config:
-        mlp_dim = config.intermediate_size_mlp
-    vocab_size = config.vocab_size
-    kv_dim = embd * num_kv_heads // num_heads
-    if "q_lora_rank" in config:
-        q_lora_rank = config.q_lora_rank
-    else:
-        q_lora_rank = -1
-    if "kv_lora_rank" in config:
-        kv_lora_rank = config.kv_lora_rank
-    else:
-        kv_lora_rank = -1
+#     batch_size = config.batch_size
+#     seq_len = config.seq_len
+#     embd = config.hidden_size
+#     num_heads = config.num_attention_heads
+#     head_dim = config.hidden_size // config.num_attention_heads
+#     if "num_key_value_heads" in config:
+#         num_kv_heads = config.num_key_value_heads
+#     else:
+#         num_kv_heads = num_heads
+#     inter_dim = embd
+#     mlp_dim = embd
+#     if "intermediate_size" in config:
+#         inter_dim = config.intermediate_size
+#     if "intermediate_size_mlp" in config:
+#         mlp_dim = config.intermediate_size_mlp
+#     vocab_size = config.vocab_size
+#     kv_dim = embd * num_kv_heads // num_heads
+#     if "q_lora_rank" in config:
+#         q_lora_rank = config.q_lora_rank
+#     else:
+#         q_lora_rank = -1
+#     if "kv_lora_rank" in config:
+#         kv_lora_rank = config.kv_lora_rank
+#     else:
+#         kv_lora_rank = -1
 
-    modes_extents = {
-        "b": batch_size,
-        "s": seq_len,
-        "e": embd,
-        "f": embd,
-        "h": num_heads,
-        "d": head_dim,
-        "v": vocab_size,
-        "m": mlp_dim,
-        "i": inter_dim,
-        "n": num_kv_heads,
-        "k": kv_dim,
-        "P": world_size,
-        "q": q_lora_rank,
-        "l": kv_lora_rank,
-    }
+#     modes_extents = {
+#         "b": batch_size,
+#         "s": seq_len,
+#         "e": embd,
+#         "f": embd,
+#         "h": num_heads,
+#         "d": head_dim,
+#         "v": vocab_size,
+#         "m": mlp_dim,
+#         "i": inter_dim,
+#         "n": num_kv_heads,
+#         "k": kv_dim,
+#         "P": world_size,
+#         "q": q_lora_rank,
+#         "l": kv_lora_rank,
+#     }
 
-    def shape_to_einsum(fake_tensor_shape: torch.Size) -> str:
-        # b: batch size
-        # e: embedding size
-        # h: num heads
-        # d: head dim
-        # v: vocab size
-        # m: mlp dim
-        # n: num kv heads
-        # P: world size
-        einsum_str = ""
-        e_used = False
-        for dim in fake_tensor_shape:
-            if dim == embd:
-                if not e_used:
-                    einsum_str += "e"
-                    e_used = True
-                else:
-                    einsum_str += "f"
-            elif dim == num_heads:
-                einsum_str += "h"
-            elif dim == head_dim:
-                einsum_str += "d"
-            elif dim == vocab_size:
-                einsum_str += "v"
-            elif dim == mlp_dim:
-                einsum_str += "m"
-            elif dim == num_kv_heads:
-                einsum_str += "n"
-            elif dim == world_size:
-                einsum_str += "P"
-            elif dim == seq_len:
-                einsum_str += "s"
-            elif dim == batch_size:
-                einsum_str += "b"
-            elif dim == kv_dim:
-                einsum_str += "k"
-            elif dim == q_lora_rank:
-                einsum_str += "q"
-            elif dim == kv_lora_rank:
-                einsum_str += "l"
-            else:
-                einsum_str += "u"
-                ad_logger.debug(f"Unknown dimension: {dim}")
+#     def shape_to_einsum(fake_tensor_shape: torch.Size) -> str:
+#         # b: batch size
+#         # e: embedding size
+#         # h: num heads
+#         # d: head dim
+#         # v: vocab size
+#         # m: mlp dim
+#         # n: num kv heads
+#         # P: world size
+#         einsum_str = ""
+#         e_used = False
+#         for dim in fake_tensor_shape:
+#             if dim == embd:
+#                 if not e_used:
+#                     einsum_str += "e"
+#                     e_used = True
+#                 else:
+#                     einsum_str += "f"
+#             elif dim == num_heads:
+#                 einsum_str += "h"
+#             elif dim == head_dim:
+#                 einsum_str += "d"
+#             elif dim == vocab_size:
+#                 einsum_str += "v"
+#             elif dim == mlp_dim:
+#                 einsum_str += "m"
+#             elif dim == num_kv_heads:
+#                 einsum_str += "n"
+#             elif dim == world_size:
+#                 einsum_str += "P"
+#             elif dim == seq_len:
+#                 einsum_str += "s"
+#             elif dim == batch_size:
+#                 einsum_str += "b"
+#             elif dim == kv_dim:
+#                 einsum_str += "k"
+#             elif dim == q_lora_rank:
+#                 einsum_str += "q"
+#             elif dim == kv_lora_rank:
+#                 einsum_str += "l"
+#             else:
+#                 einsum_str += "u"
+#                 ad_logger.debug(f"Unknown dimension: {dim}")
 
-        return einsum_str
+#         return einsum_str
 
-    import copy
+#     import copy
 
-    seq_len_copy = copy.deepcopy(seq_len)
-    a = 1
-    # first pass over nodes - assign dist_tensor to each node
-    for n in gm.graph.nodes:
-        # infer data shapes
-        # if tensor_meta is available, use it to infer the shape
-        if "tensor_meta" in n.meta:
-            tensor_meta = n.meta["tensor_meta"]
-        else:
-            # get it from parent or child node
-            if len(n.args) > 0:
-                parent_node = n.args[0]
-                if isinstance(parent_node, tuple):
-                    parent_node = parent_node[0]
-                if "tensor_meta" not in parent_node.meta:
-                    tensor_meta = None
-                else:
-                    tensor_meta = parent_node.meta["tensor_meta"]
-            elif len(n.users) > 0:
-                child_node = list(n.users)[0]
-                tensor_meta = child_node.meta["tensor_meta"]
-            else:
-                raise ValueError(f"Node {n} has no args or users")
+#     seq_len_copy = copy.deepcopy(seq_len)
+#     a = 1
+#     # first pass over nodes - assign dist_tensor to each node
+#     for n in gm.graph.nodes:
+#         # infer data shapes
+#         # if tensor_meta is available, use it to infer the shape
+#         if "tensor_meta" in n.meta:
+#             tensor_meta = n.meta["tensor_meta"]
+#         else:
+#             # get it from parent or child node
+#             if len(n.args) > 0:
+#                 parent_node = n.args[0]
+#                 if isinstance(parent_node, tuple):
+#                     parent_node = parent_node[0]
+#                 if "tensor_meta" not in parent_node.meta:
+#                     tensor_meta = None
+#                 else:
+#                     tensor_meta = parent_node.meta["tensor_meta"]
+#             elif len(n.users) > 0:
+#                 child_node = list(n.users)[0]
+#                 tensor_meta = child_node.meta["tensor_meta"]
+#             else:
+#                 raise ValueError(f"Node {n} has no args or users")
             
-                # figure out the tensor shape as an einsum string
-        if tensor_meta is not None:
-            einsum_str = shape_to_einsum(tensor_meta.shape)
-        else:
-            einsum_str = "u"  # u for unknown
+#                 # figure out the tensor shape as an einsum string
+#         if tensor_meta is not None:
+#             einsum_str = shape_to_einsum(tensor_meta.shape)
+#         else:
+#             einsum_str = "u"  # u for unknown
 
-        dist_tensor = DistributedTensor(modes_extents, einsum_str)
-        n.meta["dist_tensor"] = dist_tensor
+#         dist_tensor = DistributedTensor(modes_extents, einsum_str)
+#         n.meta["dist_tensor"] = dist_tensor
 
-        if is_contraction_op(n):
-            # find the input distribution
-            sources = find_all_boundary_nodes(
-                n,
-                # lambda x: is_aggregation_op(x),
-                lambda x: is_contraction_op(x),
-                attr_next="args",
-            )
-            if sources:
-                if len(sources) > 1:
-                    a = 1
-                input_p_grid = sources.meta["p_grid"]
-                prev_rank_order = input_p_grid.rank_order
-            else:
-                prev_rank_order = (2, 1, 0)
+#         if is_contraction_op(n):
+#             # find the input distribution
+#             sources = find_all_boundary_nodes(
+#                 n,
+#                 # lambda x: is_aggregation_op(x),
+#                 lambda x: is_contraction_op(x),
+#                 attr_next="args",
+#             )
+#             if sources:
+#                 if len(sources) > 1:
+#                     a = 1
+#                 input_p_grid = sources.meta["p_grid"]
+#                 prev_rank_order = input_p_grid.rank_order
+#             else:
+#                 prev_rank_order = (2, 1, 0)
             
-            # find the required output distribution
-            sinks = find_all_boundary_nodes(
-                n,
-                lambda x: is_aggregation_op(x),
-                attr_next="users",
-            )
-            dim = None
-            if sinks:
-                if len(sinks) > 1:
-                    a = 1
-                op, dim = is_aggregation_op(sinks[0])
-            if dim is not None:
-                pass
+#             # find the required output distribution
+#             sinks = find_all_boundary_nodes(
+#                 n,
+#                 lambda x: is_aggregation_op(x),
+#                 attr_next="users",
+#             )
+#             dim = None
+#             if sinks:
+#                 if len(sinks) > 1:
+#                     a = 1
+#                 op, dim = is_aggregation_op(sinks[0])
+#             if dim is not None:
+#                 pass
 
-            # Infer the contraction einsum string
-            A = n.args[0].meta["dist_tensor"]
-            B = n.args[1].meta["dist_tensor"]
-            C = n.meta["dist_tensor"]
+#             # Infer the contraction einsum string
+#             A = n.args[0].meta["dist_tensor"]
+#             B = n.args[1].meta["dist_tensor"]
+#             C = n.meta["dist_tensor"]
             
-            contraction_einsum_str = f"{A.einsum_str},{B.einsum_str}->{C.einsum_str}"
-            a = 1
-            # assert A.N == B.N, "Input tensors must have the same embedding dimension"
-            # assert A.K == B.K, "Input tensors must have the same embedding dimension"
-            # assert A.M == C.M, "Output tensor must have the same embedding dimension"
-            # assert A.K == C.K, "Output tensor must have the same embedding dimension"
-            # We assume that the linear node performs contraction:
-            # Y = X @ W^T
-            # defined by the einsum string:
-            # bse, ef -> bsf
-            # the mode extent f differs depending on the layer:
-            # for MLP, that is the intermediate size (mlp_dim)
-            # for standard attention, Q and Out projections that is the embedding size (embd)
-            # for the key and value projections, that is the embedding size (embd)
-            # for the output, that is the embedding size (embd)
-            # for the input, that is the embedding size (embd)
-            # for the key, that is the embedding size (embd)
-            # for the value, that is the embedding size (embd)
-            # for the query, that is the embedding size (embd)
+#             contraction_einsum_str = f"{A.einsum_str},{B.einsum_str}->{C.einsum_str}"
+#             a = 1
+#             # assert A.N == B.N, "Input tensors must have the same embedding dimension"
+#             # assert A.K == B.K, "Input tensors must have the same embedding dimension"
+#             # assert A.M == C.M, "Output tensor must have the same embedding dimension"
+#             # assert A.K == C.K, "Output tensor must have the same embedding dimension"
+#             # We assume that the linear node performs contraction:
+#             # Y = X @ W^T
+#             # defined by the einsum string:
+#             # bse, ef -> bsf
+#             # the mode extent f differs depending on the layer:
+#             # for MLP, that is the intermediate size (mlp_dim)
+#             # for standard attention, Q and Out projections that is the embedding size (embd)
+#             # for the key and value projections, that is the embedding size (embd)
+#             # for the output, that is the embedding size (embd)
+#             # for the input, that is the embedding size (embd)
+#             # for the key, that is the embedding size (embd)
+#             # for the value, that is the embedding size (embd)
+#             # for the query, that is the embedding size (embd)
 
-            n.meta["p_grid"] = PGrid(
-                M_global=batch_size * seq_len,
-                N_global=embd,
-                K_global=embd,
-                world_size=world_size,
-                rank_order=(prev_rank_order[2], prev_rank_order[1], prev_rank_order[0]),
-                nonparallelizable_dim=dim,
-            )
+#             n.meta["p_grid"] = PGrid(
+#                 M_global=batch_size * seq_len,
+#                 N_global=embd,
+#                 K_global=embd,
+#                 world_size=world_size,
+#                 rank_order=(prev_rank_order[2], prev_rank_order[1], prev_rank_order[0]),
+#                 nonparallelizable_dim=dim,
+#             )
 
             
 
 
 
-    linear_layers = [n for n in gm.graph.nodes if is_linear_op(n)]
-    aggregation_nodes = [n for n in gm.graph.nodes if is_aggregation_op(n)]
+#     linear_layers = [n for n in gm.graph.nodes if is_linear_op(n)]
+#     aggregation_nodes = [n for n in gm.graph.nodes if is_aggregation_op(n)]
 
-    # second pass over nodes - find all linear nodes and assign distributed computation grid PGrid to each node
-    for n in gm.graph.nodes:
-        if is_linear_op(n, include_quantization=True):
-            prev = bfs(
-                n,
-                lambda x: is_aggregation_op(x),
-                attr_next="args",
-                skip_root=True,
-                allow_empty=True,
-            )
-            if prev is not None:
-                input_p_grid = prev.meta["p_grid"]
-                prev_rank_order = input_p_grid.rank_order
-            else:
-                prev_rank_order = (2, 1, 0)
-            successor = bfs(
-                n,
-                lambda x: is_aggregation_op(x),
-                attr_next="users",
-                skip_root=True,
-                allow_empty=True,
-            )
-            dim = None
-            if successor is not None:
-                op, dim = is_aggregation_op(successor)
-            if dim is not None:
-                pass
-            n.meta["p_grid"] = PGrid(
-                M_global=batch_size * seq_len,
-                N_global=embd,
-                K_global=embd,
-                world_size=world_size,
-                rank_order=(prev_rank_order[2], prev_rank_order[1], prev_rank_order[0]),
-            )
+#     # second pass over nodes - find all linear nodes and assign distributed computation grid PGrid to each node
+#     for n in gm.graph.nodes:
+#         if is_linear_op(n, include_quantization=True):
+#             prev = bfs(
+#                 n,
+#                 lambda x: is_aggregation_op(x),
+#                 attr_next="args",
+#                 skip_root=True,
+#                 allow_empty=True,
+#             )
+#             if prev is not None:
+#                 input_p_grid = prev.meta["p_grid"]
+#                 prev_rank_order = input_p_grid.rank_order
+#             else:
+#                 prev_rank_order = (2, 1, 0)
+#             successor = bfs(
+#                 n,
+#                 lambda x: is_aggregation_op(x),
+#                 attr_next="users",
+#                 skip_root=True,
+#                 allow_empty=True,
+#             )
+#             dim = None
+#             if successor is not None:
+#                 op, dim = is_aggregation_op(successor)
+#             if dim is not None:
+#                 pass
+#             n.meta["p_grid"] = PGrid(
+#                 M_global=batch_size * seq_len,
+#                 N_global=embd,
+#                 K_global=embd,
+#                 world_size=world_size,
+#                 rank_order=(prev_rank_order[2], prev_rank_order[1], prev_rank_order[0]),
+#             )
 
-    # TODO: continue updating these lists
-    # pointwise ops that don't affect the sharder
-    pointwise_ops = {
-        torch.ops.aten.gelu,
-        torch.ops.aten.leaky_relu,
-        torch.ops.aten.mul,
-        torch.ops.aten.relu,
-        torch.ops.aten.sigmoid,
-        torch.ops.aten.silu,
-        torch.ops.aten.tanh,
-        torch.ops.aten.contiguous,
-    }
+#     # TODO: continue updating these lists
+#     # pointwise ops that don't affect the sharder
+#     pointwise_ops = {
+#         torch.ops.aten.gelu,
+#         torch.ops.aten.leaky_relu,
+#         torch.ops.aten.mul,
+#         torch.ops.aten.relu,
+#         torch.ops.aten.sigmoid,
+#         torch.ops.aten.silu,
+#         torch.ops.aten.tanh,
+#         torch.ops.aten.contiguous,
+#     }
 
-    # acceptable attention nodes between sharded GEMMs
-    shardable_attention_nodes = {
-        torch.ops.attention.scaled_dot_product_attention,
-        torch.ops.attention.grouped_sdpa,
-        torch.ops.attention.bsnd_grouped_sdpa,
-    }
+#     # acceptable attention nodes between sharded GEMMs
+#     shardable_attention_nodes = {
+#         torch.ops.attention.scaled_dot_product_attention,
+#         torch.ops.attention.grouped_sdpa,
+#         torch.ops.attention.bsnd_grouped_sdpa,
+#     }
 
-    # This is a heuristic. Basically, we assume those are okay to shard if we also encounter an
-    # attention node because we know that those ops must be compatible with the attention op. Now
-    # since the attention op is shardable, we will assume those are as well if used in conjunction
-    # with the attention op.
-    shardable_nodes_with_attention = {
-        torch.ops.aten.view,
-        torch.ops.aten.reshape,
-        torch.ops.rope.flashinfer,
-        operator.getitem,
-    }
+#     # This is a heuristic. Basically, we assume those are okay to shard if we also encounter an
+#     # attention node because we know that those ops must be compatible with the attention op. Now
+#     # since the attention op is shardable, we will assume those are as well if used in conjunction
+#     # with the attention op.
+#     shardable_nodes_with_attention = {
+#         torch.ops.aten.view,
+#         torch.ops.aten.reshape,
+#         torch.ops.rope.flashinfer,
+#         operator.getitem,
+#     }
 
-    # let's look at linear nodes we can identify between pairs of boundary nodes
-    # There is three potential cases we can handle:
-    # 1. No linear nodes:
-    #       --> just continue
-    # 2. Two groups of linear nodes and we can account for all to the view nodes:
-    #       --> row_split (dim 0) 1st group + check for supported nodes +
-    #           col_split (dim 1) 2nd group + all_reduce output of 2nd group
-    # 3. Linear nodes that are not in two groups or we cannot account for all nodes:
-    #       --> row_split (dim 0 of weight) + all_gather (dim -1 of output) output
-    for n_start, n_end in zip(boundary_nodes[:-1], boundary_nodes[1:]):
-        # we iterate through all nodes between the two boundary nodes and store linear nodes
-        # sorted by their input activation node. We also store remaining nodes.
-        nodes_linear: DefaultDict[Node, List[Node]] = defaultdict(list)
-        attention_nodes: Set[Node] = set()
-        attention_related_nodes: Set[Node] = set()
-        unaccounted_nodes: Set[Node] = set()
-        current_node = n_start
-        while current_node != n_end:
-            if is_linear_op(current_node, include_quantization=True):
-                nodes_linear[current_node.args[0]].append(current_node)
-            elif is_op(current_node, shardable_attention_nodes):
-                attention_nodes.add(current_node)
-            elif is_op(current_node, shardable_nodes_with_attention):
-                attention_related_nodes.add(current_node)
-            elif not is_op(current_node, pointwise_ops):
-                unaccounted_nodes.add(current_node)
-            current_node = current_node.next
-            assert current_node, "Could not identify next node"
+#     # let's look at linear nodes we can identify between pairs of boundary nodes
+#     # There is three potential cases we can handle:
+#     # 1. No linear nodes:
+#     #       --> just continue
+#     # 2. Two groups of linear nodes and we can account for all to the view nodes:
+#     #       --> row_split (dim 0) 1st group + check for supported nodes +
+#     #           col_split (dim 1) 2nd group + all_reduce output of 2nd group
+#     # 3. Linear nodes that are not in two groups or we cannot account for all nodes:
+#     #       --> row_split (dim 0 of weight) + all_gather (dim -1 of output) output
+#     for n_start, n_end in zip(boundary_nodes[:-1], boundary_nodes[1:]):
+#         # we iterate through all nodes between the two boundary nodes and store linear nodes
+#         # sorted by their input activation node. We also store remaining nodes.
+#         nodes_linear: DefaultDict[Node, List[Node]] = defaultdict(list)
+#         attention_nodes: Set[Node] = set()
+#         attention_related_nodes: Set[Node] = set()
+#         unaccounted_nodes: Set[Node] = set()
+#         current_node = n_start
+#         while current_node != n_end:
+#             if is_linear_op(current_node, include_quantization=True):
+#                 nodes_linear[current_node.args[0]].append(current_node)
+#             elif is_op(current_node, shardable_attention_nodes):
+#                 attention_nodes.add(current_node)
+#             elif is_op(current_node, shardable_nodes_with_attention):
+#                 attention_related_nodes.add(current_node)
+#             elif not is_op(current_node, pointwise_ops):
+#                 unaccounted_nodes.add(current_node)
+#             current_node = current_node.next
+#             assert current_node, "Could not identify next node"
 
-        all_nodes_between_start_end = [n for n in gm.graph.nodes if n_start <= n < n_end]
+#         all_nodes_between_start_end = [n for n in gm.graph.nodes if n_start <= n < n_end]
 
-        # nothing to shard
-        if len(nodes_linear) == 0:
-            continue
+#         # nothing to shard
+#         if len(nodes_linear) == 0:
+#             continue
 
-        num_shards += 1
+#         num_shards += 1
 
-        if simple_shard_only:
-            ad_logger.debug(f"Forcing Simple Shard: Linear groups: {nodes_linear}")
-            _simple_shard(gm, nodes_linear, rank, world_size)
-            continue
+#         if simple_shard_only:
+#             ad_logger.debug(f"Forcing Simple Shard: Linear groups: {nodes_linear}")
+#             _simple_shard(gm, nodes_linear, rank, world_size)
+#             continue
 
-        # simple shard when we have != 2 groups of linear nodes
-        if len(nodes_linear) != 2:
-            ad_logger.debug(f"Linear groups: {nodes_linear}")
-            _simple_shard(gm, nodes_linear, rank, world_size)
-            continue
+#         # simple shard when we have != 2 groups of linear nodes
+#         if len(nodes_linear) != 2:
+#             ad_logger.debug(f"Linear groups: {nodes_linear}")
+#             _simple_shard(gm, nodes_linear, rank, world_size)
+#             continue
 
-        # let's look at the unnacounted nodes. They are okay as long as they fall before the
-        # first linear node or after the last linear node, i.e., outside the sharded region
-        lin_nodes_flat: Set[Node] = {n for group in nodes_linear.values() for n in group}
-        lin_nodes_passed: Set[Node] = set()
-        current_node = n_start
-        while current_node != n_end:
-            # check if this is another linear node
-            if current_node in lin_nodes_flat:
-                lin_nodes_passed.add(current_node)
+#         # let's look at the unnacounted nodes. They are okay as long as they fall before the
+#         # first linear node or after the last linear node, i.e., outside the sharded region
+#         lin_nodes_flat: Set[Node] = {n for group in nodes_linear.values() for n in group}
+#         lin_nodes_passed: Set[Node] = set()
+#         current_node = n_start
+#         while current_node != n_end:
+#             # check if this is another linear node
+#             if current_node in lin_nodes_flat:
+#                 lin_nodes_passed.add(current_node)
 
-            # check if we are OUTSIDE sharded region
-            if len(lin_nodes_passed) == 0 or lin_nodes_passed == lin_nodes_flat:
-                # remove node from unaccounted nodes since we are outside and it doesn't matter
-                unaccounted_nodes.discard(current_node)
-                attention_related_nodes.discard(current_node)
-                attention_nodes.discard(current_node)
+#             # check if we are OUTSIDE sharded region
+#             if len(lin_nodes_passed) == 0 or lin_nodes_passed == lin_nodes_flat:
+#                 # remove node from unaccounted nodes since we are outside and it doesn't matter
+#                 unaccounted_nodes.discard(current_node)
+#                 attention_related_nodes.discard(current_node)
+#                 attention_nodes.discard(current_node)
 
-            current_node = current_node.next
+#             current_node = current_node.next
 
-        # let's post-process the attention-related nodes
-        # we can disregard them if we also see attention nodes and we assume they are compatible
-        if len(attention_nodes) > 0:
-            attention_related_nodes.clear()
+#         # let's post-process the attention-related nodes
+#         # we can disregard them if we also see attention nodes and we assume they are compatible
+#         if len(attention_nodes) > 0:
+#             attention_related_nodes.clear()
 
-        # check if any unaccounted nodes are left. If so, do a simply shard
-        if unaccounted_nodes or attention_related_nodes:
-            ad_logger.debug(f"Unaccounted nodes: {unaccounted_nodes}")
-            _simple_shard(gm, nodes_linear, rank, world_size)
-            continue
+#         # check if any unaccounted nodes are left. If so, do a simply shard
+#         if unaccounted_nodes or attention_related_nodes:
+#             ad_logger.debug(f"Unaccounted nodes: {unaccounted_nodes}")
+#             _simple_shard(gm, nodes_linear, rank, world_size)
+#             continue
 
-        # If we can account for all sharded nodes, we can do a two-way shard
-        # --> row_split (dim 0) + col_split (dim 1) + all_reduce
-        for i, group in enumerate(nodes_linear.values()):
-            for n in group:
-                _insert_sharded_matmul(gm, n, i, rank, world_size, add_dist=i > 0)
+#         # If we can account for all sharded nodes, we can do a two-way shard
+#         # --> row_split (dim 0) + col_split (dim 1) + all_reduce
+#         for i, group in enumerate(nodes_linear.values()):
+#             for n in group:
+#                 _insert_sharded_matmul(gm, n, i, rank, world_size, add_dist=i > 0)
 
-    # canonicalize and return
-    if num_shards:
-        gm = canonicalize_graph(gm)
-    ad_logger.debug("After sharding: " + str(gm))
-    ad_logger.info(f"Found {num_shards} TP shards")
-    return gm
+#     # canonicalize and return
+#     if num_shards:
+#         gm = canonicalize_graph(gm)
+#     ad_logger.debug("After sharding: " + str(gm))
+#     ad_logger.info(f"Found {num_shards} TP shards")
+#     return gm
 
 
 def dp_bmm_shard(gm: GraphModule, rank: int, world_size: int) -> GraphModule:
