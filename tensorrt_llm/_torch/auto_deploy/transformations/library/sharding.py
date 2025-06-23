@@ -368,40 +368,39 @@ def column_row_shard_2(gm: GraphModule, rank: int, world_size: int, config) -> G
         if "distributed" not in n.meta:
             n.meta["distributed"] = {}
         
-        if "val" in n.meta:
-            # tensors are initially, by default, replicated
+        if 'val' in n.meta:
+            # dynamictensors are initially, by default, replicated
             input_is_column_sharded = False
         else:
-            # these are states, parameters, constants, but also, "flashinfer" falls here
+            # these are states, parameters, 
+            # constants (also tensor constants like sin/cos for rope),
+            # "flashinfer" falls here
             input_is_column_sharded = True
         
         n.meta["distributed"]["is_column_sharded"] = input_is_column_sharded
         
         
         # find the input distribution
-        try:
-            shardable_inputs = [
-                s
-                for s in n.args
-                if s is not None
-                and isinstance(s, Node)
-                and not s.op == "get_attr"
-                and (
-                    ('val' in s.meta
-                        and (isinstance(s.meta['val'], tuple)
-                        or isinstance(s.meta['val'], list)
-                        or len(s.meta['val'].shape) >= 2)
-                    )
-                    or 'val' not in s.meta
+        shardable_inputs = [
+            s
+            for s in n.args
+            if s is not None
+            and isinstance(s, Node)
+            and not s.op == "get_attr"
+            and (
+                ('val' in s.meta
+                    and (isinstance(s.meta['val'], tuple)
+                    or isinstance(s.meta['val'], list)
+                    or len(s.meta['val'].shape) >= 2)
                 )
-            ]
-        except:
-            a = 1
+                or 'val' not in s.meta
+            )
+        ]
         
         all_inputs_are_column_sharded = set([
             s.meta["distributed"]["is_column_sharded"]
             for s in shardable_inputs
-        ])
+        ])        
 
         if len(all_inputs_are_column_sharded) > 1:
             # We have conflicting input distributions: some inputs are sharded, some are not.
@@ -436,31 +435,80 @@ def column_row_shard_2(gm: GraphModule, rank: int, world_size: int, config) -> G
                 # was not, since it's static and never had a chance to pass through the sharding
                 # linear layers' logic.
                 
-                assert len(shardable_inputs) == 4, "Expecting Q, K, V, mask inputs for attention"
-                assert all([s.meta["distributed"]["is_column_sharded"] for s in shardable_inputs[:3]]), "Expecting Q, K, V to be sharded"
-                assert not shardable_inputs[3].meta["distributed"]["is_column_sharded"], "Expecting mask to be replicated"
+                if len(shardable_inputs) == 4:
+                    assert not shardable_inputs[3].meta["distributed"]["is_column_sharded"], "Expecting mask to be replicated"
+                    # If so, we just tag the mask as sharded and we are good to shard the attention op
+                    shardable_inputs[3].meta["distributed"]["is_column_sharded"] = True
+                else:                
+                    assert len(shardable_inputs) == 3, "Expecting Q, K, V inputs for attention"                    
+                    assert all([s.meta["distributed"]["is_column_sharded"] for s in shardable_inputs[:3]]), "Expecting Q, K, V to be sharded"                                
                 
-                # If so, we just tag the mask as sharded and we are good to shard the attention op
-                shardable_inputs[3].meta["distributed"]["is_column_sharded"] = True
                 all_inputs_are_column_sharded = set([True])
-            else:
-                a = 1
+            else:               
+                # Check whether this is a RoPe-type situation, that is:
+                # 1. we have some QK-related inputs that are already reshaped into heads and 
+                #    they are column-sharded 
+                # 2. we have cos/sin inputs that are "static" (don't have any aggregation op predecessors)
+                #    and they are not sharded.
+                # In that case, don't do anything and mark it as sharded.
+                # This means that dynamic inputs Q/K are sharded, static inputs are replicated,
+                # and the rope cos/sin transformations are applied to sharded Q/K states.
+                sharded_shardable = [s for s in shardable_inputs if s.meta["distributed"]["is_column_sharded"]]
+                static_not_sharded = [s for s in shardable_inputs if not s.meta["distributed"]["is_column_sharded"]]
                 
-                # # # 2. Shard the input that is not sharded
+                shapes_match = len(set([str(s.meta["val"].shape) for s in sharded_shardable])) \
+                              == len(set([str(s.meta["val"].shape) for s in static_not_sharded]))\
+                              == 1
+                
+                if not shapes_match:
+                    raise ValueError(f"Sharded and static inputs have different shapes: {sharded_shape} and {static_shape}")
+                              
+                sharded_shape = sharded_shardable[0].meta["val"].shape
+                static_shape = static_not_sharded[0].meta["val"].shape
+                  
+                head_dim_nos = [dim for dim, shape in enumerate(sharded_shape) if shape not in static_shape]
+                if len(head_dim_nos) != 1:
+                    raise ValueError(f"Sharded and static inputs have different shapes: {sharded_shape} and {static_shape}")
+                
+                # good to go. Keep not_sharded not sharded (replicated), and mark this node as sharded
+                all_inputs_are_column_sharded = set([True])
+                
                 # for s in shardable_inputs:                
                 #     if not s.meta["distributed"]["is_column_sharded"]:
-                #         with gm.graph.inserting_before(s):
-                #             local_size = s.meta["val"].shape[1] // world_size
-                #             start_idx = local_size * rank
-                #             end_idx = start_idx + local_size
-                #             if rank == world_size - 1:
-                #                 end_idx = s.meta["val"].shape[1]
-                #             print(f"slicing {s.name} from {start_idx} to {end_idx}")
-                #             tensor_slice = gm.graph.call_function(
-                #                 torch.ops.aten.slice.Tensor, args=(s, 0, start_idx, end_idx, 1)
-                #             )
-                #             # Update BMM node to use the sliced tensor
-                #             n.update_arg(n.args.index(s), tensor_slice)
+                #         # only static tensors can be sharded, that is, the ones that 
+                #         # don't have any aggregation op predecessors
+                #         sources = find_all_boundary_nodes(
+                #             s,
+                #             lambda x: is_aggregation_op(x),
+                #             attr_next="args",
+                #         )
+                #         if len(sources) == 0:
+                #             if len(s.meta["val"].shape) != 3:
+                #                 a = 1
+                #             arg_idx = n.args.index(s)
+                #             distribute_tensor(gm, 
+                #                       consumer_node = n, 
+                #                       tensor_node = s, 
+                #                       split_dim = -1, 
+                #                       arg_idx = arg_idx, 
+                #                       start_idx = heads_per_rank * rank, 
+                #                       end_idx = heads_per_rank * (rank + 1))
+                            
+                            
+                            
+                #             with gm.graph.inserting_before(s):
+                #                 local_size = s.meta["val"].shape[1] // world_size
+                #                 start_idx = local_size * rank
+                #                 end_idx = start_idx + local_size
+                #                 if rank == world_size - 1:
+                #                     end_idx = s.meta["val"].shape[1]
+                #                 print(f"slicing {s.name} from {start_idx} to {end_idx}")
+                #                 tensor_slice = gm.graph.call_function(
+                #                     torch.ops.aten.slice.Tensor, args=(s, 0, start_idx, end_idx, 1)
+                #                 )
+                #                 # Update BMM node to use the sliced tensor
+                #                 n.update_arg(n.args.index(s), tensor_slice)
+                #             s.meta["distributed"]["is_column_sharded"] = True
 
             
             

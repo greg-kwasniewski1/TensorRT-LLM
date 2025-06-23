@@ -394,7 +394,17 @@ def predecessors(node: Node,
     """
     predecessor_list = []
     for next_node in node.args:
-        if next_node is None or not isinstance(next_node, Node):
+        if next_node is None:
+            continue
+        if isinstance(next_node, list) or isinstance(next_node, tuple):
+            for n in next_node:
+                if n is not None and isinstance(n, Node):
+                    if boundary_condition is not None and boundary_condition(n):
+                        continue
+                    if n not in predecessor_list:
+                        predecessor_list.append(n)
+                        predecessor_list.extend(predecessors(n, boundary_condition))
+        if not isinstance(next_node, Node):
             continue
         if boundary_condition is not None and boundary_condition(next_node):
             continue

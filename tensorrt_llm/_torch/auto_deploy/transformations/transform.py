@@ -17,7 +17,7 @@ from .export import torch_export_to_gm
 from .library import (
     column_row_shard,
     column_row_shard_2,
-    distribute_3d,
+    # distribute_3d,
     dp_bmm_shard,
     eliminate_redundant_transposes,
     ep_shard,

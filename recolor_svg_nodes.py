@@ -48,11 +48,11 @@ if __name__ == "__main__":
     unaccounted_color = "#ff0000" # red
 
     nodes = {
-        start_color: ["simple","simple_1","simple_2","simple_3"], # ["bmm", "bmm_1"],
+        start_color: ["simple_1","simple_2","simple_3"], # ["bmm", "bmm_1"],
         end_color: ["simple_4"],
         #     "mean_1", "mean_2", "mean_3", "mean_4", "mean_5", "mean_6",
         #     "mean_7", "mean_8"
         # ],
-        unaccounted_color: ["mean_1", "mean_2","mean_3", "bsnd_grouped_sdpa"]
+        unaccounted_color: ["bsnd_grouped_sdpa"]
     }
     recolor(nodes)
