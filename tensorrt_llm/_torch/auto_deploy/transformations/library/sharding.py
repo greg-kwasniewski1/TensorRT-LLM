@@ -381,21 +381,28 @@ def column_row_shard_2(gm: GraphModule, rank: int, world_size: int, config) -> G
         
         
         # find the input distribution
-        shardable_inputs = [
-            s
-            for s in n.args
-            if s is not None
-            and isinstance(s, Node)
-            and not s.op == "get_attr"
-            and (
-                ('val' in s.meta
-                    and (isinstance(s.meta['val'], tuple)
-                    or isinstance(s.meta['val'], list)
-                    or len(s.meta['val'].shape) >= 2)
+        try:
+            shardable_inputs = [
+                s
+                for s in n.args
+                if s is not None
+                and isinstance(s, Node)
+                and not s.op == "get_attr"
+                and (
+                    ('val' in s.meta
+                        and (isinstance(s.meta['val'], tuple)
+                        or isinstance(s.meta['val'], list)
+                        or (
+                            hasattr(s.meta['val'], 'shape')
+                            and
+                            len(s.meta['val'].shape) >= 2)
+                        )
+                    )
+                    or 'val' not in s.meta
                 )
-                or 'val' not in s.meta
-            )
-        ]
+            ]
+        except:
+            a = 1
         
         all_inputs_are_column_sharded = set([
             s.meta["distributed"]["is_column_sharded"]

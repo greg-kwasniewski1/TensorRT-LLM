@@ -188,7 +188,7 @@ class InferenceOptimizer:
         egm = dp_bmm_shard(egm, local_rank, world_size)
         
         # run TP sharding across ranks
-        # visualize_graph(egm, filename=f"{config.model_type}_before_sharding.svg")
+        visualize_graph(egm, filename=f"{config.model_type}_before_sharding.svg")
         egm = column_row_shard_2(egm, local_rank, world_size, config)
 
         # let's run a shape propagation pass to update the graph with correct meta values for

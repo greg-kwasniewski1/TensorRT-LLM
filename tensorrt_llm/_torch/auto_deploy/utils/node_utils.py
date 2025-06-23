@@ -743,11 +743,13 @@ def _extract_aggregation_dimension(node: Node) -> Optional[int]:
 
     # Check args first (positional parameters)
     if is_op(node, {torch.ops.aten.softmax, torch.ops.aten.log_softmax}):
-        # For softmax: softmax(input, dim, dtype=None)
-        if len(node.args) >= 2:
-            return node.args[1]
-        else:
-            raise ValueError(f"Softmax operation {node.target} has no dimension parameter")
+        # softmax always aggregates over embedding dimension
+        return 2
+        # # For softmax: softmax(input, dim, dtype=None)
+        # if len(node.args) >= 2:
+        #     return node.args[1]
+        # else:
+        #     raise ValueError(f"Softmax operation {node.target} has no dimension parameter")
     elif is_op(
         node,
         {
