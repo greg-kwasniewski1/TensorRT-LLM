@@ -463,11 +463,26 @@ def column_row_shard_2(gm: GraphModule, rank: int, world_size: int, config) -> G
                 sharded_shardable = [s for s in shardable_inputs if s.meta["distributed"]["is_column_sharded"]]
                 static_not_sharded = [s for s in shardable_inputs if not s.meta["distributed"]["is_column_sharded"]]
                 
-                shapes_match = len(set([str(s.meta["val"].shape) for s in sharded_shardable])) \
-                              == len(set([str(s.meta["val"].shape) for s in static_not_sharded]))\
-                              == 1
+                # check whether all tensors in sharded_shardable are 4-dimensional
+                # and all tensors in static_not_sharded are 3-dimensional
+                # if so, we can proceed
+                if not (all([len(s.meta["val"].shape) == 4 for s in sharded_shardable]) and \
+                   all([len(s.meta["val"].shape) == 3 for s in static_not_sharded])):
+                    raise ValueError(f"Sharded and static inputs have different shapes: {sharded_shape} and {static_shape}")
                 
-                if not shapes_match:
+                # check whether the shapes of all static_not_sharded are the same
+                if not all([s.meta["val"].shape == static_not_sharded[0].meta["val"].shape for s in static_not_sharded]):
+                    raise ValueError(f"Sharded and static inputs have different shapes: {sharded_shape} and {static_shape}")
+                
+                # sharded_shardable shapes may differ in the 3rd dimension (number of heads), since the number of Q heads
+                # may be different than KV heads. 
+                
+                # take the shape of the static_not_sharded, add a dummy dimension to the 3rd position
+                static_not_sharded_dummy_shape = static_not_sharded[0].meta["val"].shape[:2] + (1,) + static_not_sharded[0].meta["val"].shape[2:]
+                
+                # now check whether dimensions 0, 1, and 3 (batch, sequence, head_dim) are the same for all 
+                # sharded_shardable and static_not_sharded_dummy_shape
+                if not all([s.meta["val"].shape[i] == static_not_sharded_dummy_shape[i] for s in sharded_shardable for i in [0, 1, 3]]):
                     raise ValueError(f"Sharded and static inputs have different shapes: {sharded_shape} and {static_shape}")
                               
                 sharded_shape = sharded_shardable[0].meta["val"].shape
