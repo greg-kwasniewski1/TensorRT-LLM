@@ -87,3 +87,5 @@ def visualize_namespace(gm: fx.GraphModule, args: Tuple[torch.Tensor, ...], dyna
             n.meta["nn_module_stack"] = n.args[0].meta["nn_module_stack"]
 
     model_explorer.visualize_pytorch("model-viz", ep)
+
+

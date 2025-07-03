@@ -16,6 +16,7 @@ from ._graph import canonicalize_graph, lift_to_meta, move_to_device
 from .export import torch_export_to_gm
 from .library import (
     column_row_shard,
+    column_row_shard_2,
     dp_bmm_shard,
     eliminate_redundant_transposes,
     ep_shard,
@@ -36,6 +37,42 @@ from .library import (
     update_in_out_nodes,
 )
 
+
+
+from torch.utils._pytree import register_pytree_node
+from transformers.cache_utils import HybridChunkedCache
+
+# Register HybridChunkedCache as a PyTree type
+def hybrid_cache_flatten(cache):
+    """Flatten HybridChunkedCache into a format that can be handled by PyTorch's export."""
+    attrs = {}
+    for key, value in cache.__dict__.items():
+        if hasattr(value, 'shape'):  # If it's a tensor-like object
+            attrs[key] = value
+    return (attrs,), None
+
+def hybrid_cache_unflatten(aux_data, children):
+    """Reconstruct HybridChunkedCache from flattened data."""
+    attrs, = children
+    cache = HybridChunkedCache()
+    for key, value in attrs.items():
+        setattr(cache, key, value)
+    return cache
+
+# Register the type
+register_pytree_node(
+    HybridChunkedCache,
+    hybrid_cache_flatten,
+    hybrid_cache_unflatten
+)
+
+
+from torch.fx.passes.graph_drawer import FxGraphDrawer
+
+def visualize_graph(gm: GraphModule, filename: str = "graph.svg"):
+    drawer = FxGraphDrawer(gm, "my_module")
+    dot_graph = drawer.get_dot_graph()
+    dot_graph.write_svg(filename)
 
 class InferenceOptimizer:
     def __init__(self, factory: ModelFactory, ad_config: LlmArgs):
@@ -64,12 +101,15 @@ class InferenceOptimizer:
         ############################################################################################
         # EXPORT MODEL TO GRAPH MODULE
         ############################################################################################
-
+        config = model.config
+        
+        
         cm.info.set_example_sequence()
         egm = torch_export_to_gm(model, args=cm.args, dynamic_shapes=cm.dynamic_shapes)
         del model
         ad_logger.debug("original graph: " + str(egm))
         local_rank, world_size = dist_ad.get_rank_world_size()
+        world_size = 2
 
         ############################################################################################
         # RUN PATTERN MATCHER TRANSFORMATIONS TO STANDARDIZE GRAPH REPRESENTATION
@@ -116,13 +156,17 @@ class InferenceOptimizer:
         egm = optimize_rope(egm)
 
         # run TP sharding across ranks
-        egm = column_row_shard(egm, local_rank, world_size, self.ad_config.simple_shard_only)
+        # visualize_graph(egm, filename=f"{config.model_type}_before_col_row_sharding.svg")
+        # egm = column_row_shard(egm, local_rank, world_size, self.ad_config.simple_shard_only)
 
         # run EP sharding across ranks
         egm = ep_shard(egm, local_rank, world_size)
 
         # run BMM sharding across ranks
         egm = dp_bmm_shard(egm, local_rank, world_size)
+        
+        # visualize_graph(egm, filename=f"{config.model_type}_before_top_sharding.svg")
+        egm = column_row_shard_2(egm, local_rank, world_size)
 
         # let's run a shape propagation pass to update the graph with correct meta values for
         # subsequent optimization passes. Lift state_dict to meta as shape propagation involves device check

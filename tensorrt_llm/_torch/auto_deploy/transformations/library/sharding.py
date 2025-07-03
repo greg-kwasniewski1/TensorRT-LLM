@@ -28,6 +28,8 @@ from torch.fx import GraphModule, Node
 
 from ...utils.logger import ad_logger
 from ...utils.node_utils import (
+    is_attention_op,
+    is_aggregation_op,
     extract_param_names_from_lin_node,
     identify_regions_between_residuals,
     is_linear_op,
@@ -311,13 +313,13 @@ def column_row_shard(
         num_shards += 1
 
         if simple_shard_only:
-            ad_logger.debug(f"Forcing Simple Shard: Linear groups: {nodes_linear}")
+            print(f"Forcing Simple Shard: Linear groups: {nodes_linear}")
             _simple_shard(gm, nodes_linear, rank, world_size)
             continue
 
         # simple shard when we have != 2 groups of linear nodes
         if len(nodes_linear) != 2:
-            ad_logger.debug(f"Linear groups: {nodes_linear}")
+            print(f"Linear groups: {nodes_linear}")
             _simple_shard(gm, nodes_linear, rank, world_size)
             continue
 
@@ -347,7 +349,7 @@ def column_row_shard(
 
         # check if any unaccounted nodes are left. If so, do a simply shard
         if unaccounted_nodes or attention_related_nodes:
-            ad_logger.debug(f"Unaccounted nodes: {unaccounted_nodes}")
+            print(f"Unaccounted nodes: {unaccounted_nodes}")
             _simple_shard(gm, nodes_linear, rank, world_size)
             continue
 
@@ -359,7 +361,7 @@ def column_row_shard(
             if len(attention_nodes) > 1:
                 # Column-row shard boundary region detection is probably wrong - there should be
                 # only one attention operation. Fall back to simple shard.
-                ad_logger.debug(f"More than one attention node: {unaccounted_nodes}")
+                print(f"More than one attention node: {unaccounted_nodes}")
                 _simple_shard(gm, nodes_linear, rank, world_size)
                 continue
             # Extract head dimension. We cannot shard below the head_dim size.
@@ -369,6 +371,7 @@ def column_row_shard(
             min_local_shape = 1
         for i, group in enumerate(nodes_linear.values()):
             for n in group:
+                print(f"column-row shard for node: {n.name}")
                 _insert_sharded_matmul(
                     gm, n, i, rank, world_size, add_dist=i > 0, min_local_shape=min_local_shape
                 )
@@ -507,3 +510,449 @@ def dp_bmm_shard(gm: GraphModule, rank: int, world_size: int) -> GraphModule:
     ad_logger.debug("After sharding BMM: " + str(gm))
     ad_logger.info(f"Found {num_bmm_shards} BMM shards")
     return gm
+
+
+
+
+def column_row_shard_2(gm: GraphModule, rank: int, world_size: int) -> GraphModule:
+    # g = get_node_dict(gm)
+    for n in gm.graph.nodes:
+        if "distributed" not in n.meta:
+            n.meta["distributed"] = {}
+        
+        if 'val' in n.meta:
+            # dynamictensors are initially, by default, replicated
+            input_is_column_sharded = False
+        else:
+            if len(n.args) == 1 and isinstance(n.args[0], Node) and 'val' in n.args[0].meta:
+                # if 'val' in n.args[0].meta:
+                    n.meta['val'] = n.args[0].meta['val']
+                    input_is_column_sharded = False
+                # else:
+                #     input_is_column_sharded = True
+            else:
+                # these are states, parameters, 
+                # constants (also tensor constants like sin/cos for rope),
+                # "flashinfer" falls here
+                input_is_column_sharded = None
+        
+        n.meta["distributed"]["is_column_sharded"] = input_is_column_sharded
+        
+        
+        # find the input distribution
+        shardable_inputs = [
+            s
+            for s in n.args
+            if s is not None
+            and isinstance(s, Node)
+            and not s.op == "get_attr"
+            and (
+                ('val' in s.meta
+                    and (isinstance(s.meta['val'], tuple)
+                    or isinstance(s.meta['val'], list)
+                    or (
+                        hasattr(s.meta['val'], 'shape')
+                        and
+                        len(s.meta['val'].shape) >= 2)
+                    )
+                )
+                or s.meta['distributed']['is_column_sharded']
+            )
+        ]
+        
+        all_inputs_are_column_sharded = set([
+            s.meta["distributed"]["is_column_sharded"]
+            for s in shardable_inputs
+        ])        
+
+        if len(all_inputs_are_column_sharded) > 1:
+            # We have conflicting input distributions: some inputs are sharded, some are not.
+            # We have three options:
+            # 1. We check if indeed this operation could potentially be sharded. If not,
+            #    we made mistake in the previous sharding step and raise an error.
+            # 2. We can shard the input that is not sharded
+            # 3. We all-gather the input that is not sharded
+            
+            # 1. Check if this is legal
+            if is_aggregation_op(n) and is_aggregation_op(n)[1] == 2:
+                raise ValueError(f"Operation {n} has some of its inputs sharded, which is not allowed.")
+            
+            sinks = find_all_boundary_nodes(
+                n,
+                lambda x: is_aggregation_op(x),
+                attr_next="users",
+            )
+            if sinks:
+                all_sink_aggregation_dims = set([is_aggregation_op(s)[1] for s in sinks])
+                # dims are [batch, sequence, embedding]
+                if 2 in all_sink_aggregation_dims:
+                    # dim == 2 means that the sink aggregation operation
+                    # performs aggregation across the embedding dimension,
+                    # therefore, X cannot be shared (otherwise, that would 
+                    # imply distributed aggegation)
+                    raise ValueError(f"Operation {n} has some of its inputs sharded, which is not allowed.")
+            
+            
+            if is_attention_op(n):
+                # First three arguments are Q, K, V, and there is an optional fourth argument, the attention mask.
+                # Check if Q, K, V were sharded
+                if all([s.meta["distributed"]["is_column_sharded"] for s in shardable_inputs[:3]]):
+                    # check if this is the mask that was not sharded.
+                    #  It's static and may never had a chance to pass through the sharding
+                    # linear layers' logic.
+                    assert len(shardable_inputs) == 4, "Expecting Q, K, V, and mask inputs for attention"                    
+                    assert not shardable_inputs[3].meta["distributed"]["is_column_sharded"], "Expecting mask to be replicated"
+                    shardable_inputs[3].meta["distributed"]["is_column_sharded"] = True
+                    all_inputs_are_column_sharded = set([True])
+                
+                else:
+                    # Now we are in the situation, where at least one of Q, K, V is not sharded.
+                    # Check whether none of Q, K, V are sharded and only mask was sharded.
+                    if all([not s.meta["distributed"]["is_column_sharded"] for s in shardable_inputs[:3]]):
+                        assert len(shardable_inputs) == 4, "Expecting Q, K, V, and mask inputs for attention"                    
+                        assert shardable_inputs[3].meta["distributed"]["is_column_sharded"], "Expecting mask to be sharded"
+                        # then, we don't shard it at all.
+                        all_inputs_are_column_sharded = set([False])
+                    else:
+                        # Some of Q, K, V are sharded, and some are not.
+                        q_node, k_node, v_node = shardable_inputs[:3]
+                        # Probably, Q and K are NOT sharded because of the normalization,
+                        # while V is sharded.
+                        assert q_node.meta["distributed"]["is_column_sharded"] == False, "Expecting Q to be replicated"
+                        assert k_node.meta["distributed"]["is_column_sharded"] == False, "Expecting K to be replicated"
+                        assert v_node.meta["distributed"]["is_column_sharded"] == True, "Expecting V to be sharded"
+                        
+                        distribute_attention_node(n, gm, rank, world_size)                                    
+                        all_inputs_are_column_sharded = set([True])
+            else:               
+                # Check whether this is a RoPe-type situation, that is:
+                # 1. we have some QK-related inputs that are already reshaped into heads and 
+                #    they are column-sharded 
+                # 2. we have cos/sin inputs that are "static" (don't have any aggregation op predecessors)
+                #    and they are not sharded.
+                # In that case, don't do anything and mark it as sharded.
+                # This means that dynamic inputs Q/K are sharded, static inputs are replicated,
+                # and the rope cos/sin transformations are applied to sharded Q/K states.
+                sharded_shardable = [s for s in shardable_inputs if s.meta["distributed"]["is_column_sharded"]]
+                static_not_sharded = [s for s in shardable_inputs if not s.meta["distributed"]["is_column_sharded"]]
+                
+                # check whether all tensors in sharded_shardable are 4-dimensional
+                # and all tensors in static_not_sharded are 3-dimensional
+                # if so, we can proceed
+                if not (all([len(s.meta["val"].shape) == 4 for s in sharded_shardable]) and \
+                        all([len(s.meta["val"].shape) == 3 for s in static_not_sharded])):
+                    sharded_shape = sharded_shardable[0].meta["val"].shape if sharded_shardable else "unknown"
+                    static_shape = static_not_sharded[0].meta["val"].shape if static_not_sharded else "unknown"
+                    raise ValueError(f"Sharded and static inputs have different shapes: {sharded_shape} and {static_shape}")
+
+                # check whether the shapes of all static_not_sharded are the same
+                if not all([s.meta["val"].shape == static_not_sharded[0].meta["val"].shape for s in static_not_sharded]):
+                    sharded_shape = sharded_shardable[0].meta["val"].shape if sharded_shardable else "unknown"
+                    static_shape = static_not_sharded[0].meta["val"].shape if static_not_sharded else "unknown"
+                    raise ValueError(f"Sharded and static inputs have different shapes: {sharded_shape} and {static_shape}")
+                
+                # sharded_shardable shapes may differ in the 3rd dimension (number of heads), since the number of Q heads
+                # may be different than KV heads. 
+                
+                # take the shape of the static_not_sharded, add a dummy dimension to the 3rd position
+                static_not_sharded_dummy_shape = static_not_sharded[0].meta["val"].shape[:2] + (1,) + static_not_sharded[0].meta["val"].shape[2:]
+                
+                # now check whether dimensions 0, 1, and 3 (batch, sequence, head_dim) are the same for all 
+                # sharded_shardable and static_not_sharded_dummy_shape
+                if not all([s.meta["val"].shape[i] == static_not_sharded_dummy_shape[i] for s in sharded_shardable for i in [0, 1, 3]]):
+                    sharded_shape = sharded_shardable[0].meta["val"].shape if sharded_shardable else "unknown"
+                    static_shape = static_not_sharded[0].meta["val"].shape if static_not_sharded else "unknown"
+                    raise ValueError(f"Sharded and static inputs have different shapes: {sharded_shape} and {static_shape}")
+                              
+                sharded_shape = sharded_shardable[0].meta["val"].shape
+                static_shape = static_not_sharded[0].meta["val"].shape
+                  
+                head_dim_nos = [dim for dim, shape in enumerate(sharded_shape) if shape not in static_shape]
+                if len(head_dim_nos) != 1:
+                    raise ValueError(f"Sharded and static inputs have different shapes: {sharded_shape} and {static_shape}")
+                
+                # good to go. Keep not_sharded not sharded (replicated), and mark this node as sharded
+                all_inputs_are_column_sharded = set([True])
+                
+
+            
+            
+        if all_inputs_are_column_sharded:
+            input_is_column_sharded = all_inputs_are_column_sharded.pop()
+        n.meta["distributed"]["is_column_sharded"] = input_is_column_sharded
+        
+        # only linear ops can change distribution. All other ops preserve the distribution    
+        if is_linear_op(n):            
+            # find the required output distribution
+            sinks = find_all_boundary_nodes(
+                n,
+                lambda x: is_aggregation_op(x),
+                attr_next="users",
+            )
+            weigh = n.args[1]
+            can_output_be_column_sharded = False
+            if sinks:
+                # check if all sinks are aggregation operations
+                all_sink_aggregation_dims = set([is_aggregation_op(s)[1] for s in sinks])
+                # dims are [batch, sequence, embedding]
+                if 2 not in all_sink_aggregation_dims:
+                    # dim == 2 means that the sink aggregation operation
+                    # performs aggregation across the embedding dimension,
+                    # therefore, X cannot be shared (otherwise, that would 
+                    # imply distributed aggegation)
+                    can_output_be_column_sharded = True
+            
+            output_is_column_sharded = can_output_be_column_sharded and not input_is_column_sharded
+            _insert_sharded_matmul(gm,
+                                   n,
+                                   dim=1 if input_is_column_sharded else 0,
+                                   rank=rank,
+                                   world_size=world_size,
+                                   add_dist=not output_is_column_sharded)
+            if "distributed" not in n.meta:
+                n.meta["distributed"] = {}
+            n.meta["distributed"]["is_column_sharded"] = output_is_column_sharded
+            stat = (n, weigh.name, input_is_column_sharded, can_output_be_column_sharded, output_is_column_sharded)
+            # print(f"stat: {stat}")
+            if not can_output_be_column_sharded and not input_is_column_sharded:
+                pass
+                # print(f"\nWarning, simple shard detected! {stat}")
+            else:
+                print(f"\ncol-row Sharded shard detected! {stat}")
+            
+        # but attention nodes, if their inputs are NOT sharded, 
+        # can do a column-split to allow distributed attention computation
+        if is_attention_op(n) and not input_is_column_sharded:
+            # find the required output distribution
+            sinks = find_all_boundary_nodes(
+                n,
+                lambda x: is_aggregation_op(x),
+                attr_next="users",
+            )
+            can_output_be_column_sharded = True
+            if sinks:
+                # check if all sinks are aggregation operations
+                all_sink_aggregation_dims = set([is_aggregation_op(s)[1] for s in sinks])
+                # dims are [batch, sequence, embedding]
+                if 2 in all_sink_aggregation_dims:
+                    # dim == 2 means that the sink aggregation operation
+                    # performs aggregation across the embedding dimension,
+                    # therefore, X cannot be shared (otherwise, that would 
+                    # imply distributed aggegation)
+                    can_output_be_column_sharded = False
+            
+            if can_output_be_column_sharded:
+                inputs = [s for s in n.args if s is not None and isinstance(s, Node)]
+                assert len(inputs) >= 3, "Attention node should have at least 3 inputs"
+                q_node, k_node, v_node = inputs[:3]
+                # get the num_heads and head_dims (potentially, latent_dim > head_dim for q and k)
+                if is_op(n, torch.ops.auto_deploy.torch_attention_bsnd_grouped_sdpa):
+                    head_dim_no = 2
+                else:
+                    head_dim_no = 3
+                num_heads = q_node.meta["val"].shape[head_dim_no]
+                num_kv_heads = set([s.meta["val"].shape[head_dim_no] for s in [k_node, v_node]])
+                assert len(num_kv_heads) == 1, "K and V inputs to attention node should have the same number of heads"
+                num_kv_heads = num_kv_heads.pop()
+                assert num_heads >= num_kv_heads, "Number of heads must be greater than or equal to number of KV heads"
+                
+                assert (num_heads > world_size) and num_heads % world_size == 0, "Number of heads must be divisible by world size"
+                heads_per_rank = num_heads // world_size
+                distribute_tensor(gm,
+                                      consumer_node=n,
+                                      tensor_node=q_node,
+                                      split_dim=head_dim_no,
+                                      arg_idx=0,
+                                      start_idx=heads_per_rank * rank,
+                                      end_idx=heads_per_rank * (rank + 1))
+
+                
+                # NOTE: this is a floating point division!
+                # For models with small num_kv_heads, like Qwen, where num_kv_heads = 8,
+                # TP may be larger. This means that, e.g., if TP = 16, every two ranks will
+                # share the same single KV head.
+                kv_heads_per_rank = num_kv_heads / world_size
+                for i, src in enumerate([k_node, v_node]):
+                    # column-split the input
+                    distribute_tensor(gm,
+                                      consumer_node=n,
+                                      tensor_node=src,
+                                      split_dim=head_dim_no,
+                                      arg_idx=i+1,
+                                      # NOTE: rounding down to int is intentional!
+                                      start_idx=int(kv_heads_per_rank * rank),
+                                      end_idx=int(kv_heads_per_rank * (rank + 1)))
+                n.meta["distributed"]["is_column_sharded"] = True
+                
+        if is_attention_op(n) and not n.meta["distributed"]["is_column_sharded"]:
+            raise ValueError(f"Attention node {n} is not sharded")
+        
+    # exit(0)
+    return gm
+
+
+
+def find_all_boundary_nodes(
+    node: Node,
+    target: Callable,
+    attr_next: str = "users",
+) -> List[Node]:
+    queue = [node]
+    visited = set()
+    boundary_nodes = []
+    
+    visited.add(node)
+    queue = list(n for n in getattr(node, attr_next) if n is not None 
+                    and isinstance(n, Node))
+    while queue:
+        cur_node = queue.pop(0)
+        if target(cur_node):
+            # don't continue pass the boundary condition
+            boundary_nodes.append(cur_node)
+        else:
+            for next_node in getattr(cur_node, attr_next):
+                if next_node is None or not isinstance(next_node, Node):
+                    continue
+                if next_node not in visited:
+                    visited.add(next_node)
+                    queue.append(next_node)
+    return boundary_nodes
+
+
+def distribute_tensor(gm: GraphModule,
+        consumer_node: Node, 
+        tensor_node: Node, 
+        split_dim: int,
+        arg_idx: int, 
+        start_idx: int, end_idx: int
+    ):
+        """Unified helper function to shard either a parameter tensor or a dynamic tensor.
+
+        Args:
+            consumer_node: The node that is being processed
+            tensor_node: The input tensor node to shard
+            arg_idx: The argument index of the tensor in the consumer_node node
+            start_idx: Start index for sharding
+            end_idx: End index for sharding
+        """
+
+        # Define slice function for the sharding
+        def slice_tensor(t: torch.Tensor) -> torch.Tensor:
+            """
+            Args:
+                t: torch.Tensor: tensor to slice
+                split_dim: int: dimension across which the slice is performed
+                start_idx: int: start index of the slice
+                end_idx: int: end index of the slice
+            Returns:
+                torch.Tensor: sliced tensor
+                
+            Example:
+                t = torch.rand(8,16,32,64)
+                slice_tensor(t, 1, 0, 4) # returns a tensor of shape (8,4,32,64)
+                slice_tensor(t, 2, 4, 8) # returns a tensor of shape (8,16,4,64)
+                slice_tensor(t, 3, 16, 32) # returns a tensor of shape (8,16,32,16)
+            """
+            # Create a list of slice objects for all dimensions
+            slices = [slice(None)] * t.dim()
+            # Set the specific dimension to slice from start_idx to end_idx
+            slices[split_dim] = slice(start_idx, end_idx)
+            # Apply the slicing and return the result
+            return t[tuple(slices)]
+
+
+        if tensor_node.op == "get_attr":
+            # Handle parameter tensor
+            weight_key = tensor_node.target
+            modname, _, param_name = weight_key.rpartition(".")
+            param = gm.get_parameter(weight_key)
+
+            # Update the parameter with its shard
+            param_new = nn.Parameter(slice_tensor(param).detach().clone(), requires_grad=True)
+            gm.get_submodule(modname).register_parameter(param_name, param_new)
+
+            # Register load state dict hook
+            gm._register_load_state_dict_pre_hook(
+                partial(
+                    _load_hook,
+                    f_split=slice_tensor,
+                    param_key=weight_key,
+                    param_shape=param_new.shape,
+                )
+            )
+        else:
+            # Handle dynamic tensor
+            with gm.graph.inserting_before(consumer_node):
+                tensor_slice = gm.graph.call_function(
+                    torch.ops.aten.slice.Tensor, args=(tensor_node, split_dim, start_idx, end_idx, 1)
+                )
+            # Update BMM node to use the sliced tensor
+            consumer_node.update_arg(arg_idx, tensor_slice)
+
+
+def distribute_attention_node(n: Node, gm: GraphModule, rank: int, world_size: int):
+    sinks = find_all_boundary_nodes(
+        n,
+        lambda x: is_aggregation_op(x),
+        attr_next="users",
+    )
+    can_output_be_column_sharded = True
+    if sinks:
+        # check if all sinks are aggregation operations
+        all_sink_aggregation_dims = set([is_aggregation_op(s)[1] for s in sinks])
+        # dims are [batch, sequence, embedding]
+        if 2 in all_sink_aggregation_dims:
+            # dim == 2 means that the sink aggregation operation
+            # performs aggregation across the embedding dimension,
+            # therefore, X cannot be shared (otherwise, that would 
+            # imply distributed aggegation)
+            can_output_be_column_sharded = False
+    
+    if can_output_be_column_sharded:
+        inputs = [s for s in n.args if s is not None and isinstance(s, Node)]
+        assert len(inputs) >= 3, "Attention node should have at least 3 inputs"
+        q_node, k_node, v_node = inputs[:3]
+        # get the num_heads and head_dims (potentially, latent_dim > head_dim for q and k)
+        if is_op(n, torch.ops.auto_deploy.torch_attention_bsnd_grouped_sdpa):
+            head_dim_no = 2
+        else:
+            head_dim_no = 3
+        num_heads = q_node.meta["val"].shape[head_dim_no]
+        num_kv_heads = set([s.meta["val"].shape[head_dim_no] for s in [k_node, v_node]])
+        assert len(num_kv_heads) == 1, "K and V inputs to attention node should have the same number of heads"
+        num_kv_heads = num_kv_heads.pop()
+        assert num_heads >= num_kv_heads, "Number of heads must be greater than or equal to number of KV heads"
+        
+        assert (num_heads > world_size) and num_heads % world_size == 0, "Number of heads must be divisible by world size"
+        heads_per_rank = num_heads // world_size
+        if not q_node.meta["distributed"]["is_column_sharded"]:
+            distribute_tensor(gm,
+                                    consumer_node=n,
+                                    tensor_node=q_node,
+                                    split_dim=head_dim_no,
+                                    arg_idx=0,
+                                    start_idx=heads_per_rank * rank,
+                                    end_idx=heads_per_rank * (rank + 1))
+        else:
+            print(f"Warning: {q_node} is already sharded")
+        
+        # NOTE: this is a floating point division!
+        # For models with small num_kv_heads, like Qwen, where num_kv_heads = 8,
+        # TP may be larger. This means that, e.g., if TP = 16, every two ranks will
+        # share the same single KV head.
+        kv_heads_per_rank = num_kv_heads / world_size
+        for i, src in enumerate([k_node, v_node]):
+            if not src.meta["distributed"]["is_column_sharded"]:
+                # column-split the input
+                distribute_tensor(gm,
+                                    consumer_node=n,
+                                    tensor_node=src,
+                                    split_dim=head_dim_no,
+                                    arg_idx=i+1,
+                                    # NOTE: rounding down to int is intentional!
+                                    start_idx=int(kv_heads_per_rank * rank),
+                                    end_idx=int(kv_heads_per_rank * (rank + 1)))
+            else:
+                print(f"Warning: {src} is already sharded")
+        n.meta["distributed"]["is_column_sharded"] = True
+        
