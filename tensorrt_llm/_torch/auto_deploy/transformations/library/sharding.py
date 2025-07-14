@@ -512,16 +512,24 @@ def dp_bmm_shard(gm: GraphModule, rank: int, world_size: int) -> GraphModule:
     return gm
 
 
+def get_node_dict(gm: GraphModule) -> Dict[str, Node]:
+    node_dict = {}
+    for n in gm.graph.nodes:
+        node_dict[n.name] = n
+    return node_dict
 
 
 def column_row_shard_2(gm: GraphModule, rank: int, world_size: int) -> GraphModule:
-    # g = get_node_dict(gm)
+    g = get_node_dict(gm)
     for n in gm.graph.nodes:
+        if "zeros_" in n.name:
+            print(f"\n\nn: {n.name}\nargs: {n.args}\n meta: {n.meta}")
+            print(f"n.meta['val']: {n.meta['val']}")
         if "distributed" not in n.meta:
             n.meta["distributed"] = {}
         
         if 'val' in n.meta:
-            # dynamictensors are initially, by default, replicated
+            # dynamic tensors are initially, by default, replicated
             input_is_column_sharded = False
         else:
             if len(n.args) == 1 and isinstance(n.args[0], Node) and 'val' in n.args[0].meta:
@@ -643,7 +651,9 @@ def column_row_shard_2(gm: GraphModule, rank: int, world_size: int) -> GraphModu
                         all([len(s.meta["val"].shape) == 3 for s in static_not_sharded])):
                     sharded_shape = sharded_shardable[0].meta["val"].shape if sharded_shardable else "unknown"
                     static_shape = static_not_sharded[0].meta["val"].shape if static_not_sharded else "unknown"
-                    raise ValueError(f"Sharded and static inputs have different shapes: {sharded_shape} and {static_shape}")
+                    print(f"\nnode {n.name}, args: {n.args}, shardable_inputs: {[(s, s.args, s.meta["distributed"]["is_column_sharded"], s.meta['val']) for s in shardable_inputs]}")
+                    all_inputs_are_column_sharded = set([False])
+                    # raise ValueError(f"Sharded and static inputs have different shapes: {sharded_shape} and {static_shape}")
 
                 # check whether the shapes of all static_not_sharded are the same
                 if not all([s.meta["val"].shape == static_not_sharded[0].meta["val"].shape for s in static_not_sharded]):
@@ -662,7 +672,9 @@ def column_row_shard_2(gm: GraphModule, rank: int, world_size: int) -> GraphModu
                 if not all([s.meta["val"].shape[i] == static_not_sharded_dummy_shape[i] for s in sharded_shardable for i in [0, 1, 3]]):
                     sharded_shape = sharded_shardable[0].meta["val"].shape if sharded_shardable else "unknown"
                     static_shape = static_not_sharded[0].meta["val"].shape if static_not_sharded else "unknown"
-                    raise ValueError(f"Sharded and static inputs have different shapes: {sharded_shape} and {static_shape}")
+                    print(f"\nnode {n.name}, args: {n.args}, shardable_inputs: {[(s, s.args, s.meta["distributed"]["is_column_sharded"], s.meta['val']) for s in shardable_inputs]}")
+                    all_inputs_are_column_sharded = set([False])
+                    # raise ValueError(f"Sharded and static inputs have different shapes: {sharded_shape} and {static_shape}")
                               
                 sharded_shape = sharded_shardable[0].meta["val"].shape
                 static_shape = static_not_sharded[0].meta["val"].shape
@@ -716,9 +728,9 @@ def column_row_shard_2(gm: GraphModule, rank: int, world_size: int) -> GraphModu
             # print(f"stat: {stat}")
             if not can_output_be_column_sharded and not input_is_column_sharded:
                 pass
-                # print(f"\nWarning, simple shard detected! {stat}")
+                print(f"SIMPLE shard detected! {stat}")
             else:
-                print(f"\ncol-row Sharded shard detected! {stat}")
+                print(f"COL-ROW shard detected! {stat}")
             
         # but attention nodes, if their inputs are NOT sharded, 
         # can do a column-split to allow distributed attention computation
@@ -758,6 +770,8 @@ def column_row_shard_2(gm: GraphModule, rank: int, world_size: int) -> GraphModu
                 
                 assert (num_heads > world_size) and num_heads % world_size == 0, "Number of heads must be divisible by world size"
                 heads_per_rank = num_heads // world_size
+                
+                print(f"Distributing ATTENTION right before execution: {n.name}")
                 distribute_tensor(gm,
                                       consumer_node=n,
                                       tensor_node=q_node,
@@ -891,6 +905,7 @@ def distribute_tensor(gm: GraphModule,
 
 
 def distribute_attention_node(n: Node, gm: GraphModule, rank: int, world_size: int):
+    print(f"Distributing PARTIALLY distributed ATTENTION node: {n.name}")
     sinks = find_all_boundary_nodes(
         n,
         lambda x: is_aggregation_op(x),
